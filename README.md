@@ -226,6 +226,11 @@ go tool pprof cpu.pprof
 go run ./examples
 ```
 
+The examples runner also performs SQL analysis and prints:
+- Finding severity + code
+- Human-friendly problem statement
+- Concrete recommendation to fix/optimize
+
 ---
 
 ## License

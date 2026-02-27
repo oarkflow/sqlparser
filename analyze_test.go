@@ -34,7 +34,7 @@ func TestAnalyzeSQLRiskyPatterns(t *testing.T) {
 }
 
 func TestAnalyzeSQLJSONBHint(t *testing.T) {
-	report := sqlparser.AnalyzeSQL(`CREATE TABLE events (payload JSONB)`)
+	report := sqlparser.AnalyzeSQLWithOptions(`CREATE TABLE events (payload JSONB)`, sqlparser.AnalysisOptions{Dialect: sqlparser.DialectMySQL})
 	if !report.Valid {
 		t.Fatalf("expected valid SQL")
 	}
@@ -47,5 +47,36 @@ func TestAnalyzeSQLJSONBHint(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected JSONB_DIALECT_NOTE finding")
+	}
+}
+
+func TestAnalyzeSQLDialectFunctionMismatch(t *testing.T) {
+	report := sqlparser.AnalyzeSQLWithOptions(`SELECT IFNULL(name, 'x') FROM users`, sqlparser.AnalysisOptions{Dialect: sqlparser.DialectPostgres})
+	if !report.Valid {
+		t.Fatalf("expected valid SQL")
+	}
+	found := false
+	for _, f := range report.Findings {
+		if f.Code == "FUNCTION_DIALECT_REWRITE" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected FUNCTION_DIALECT_REWRITE finding")
+	}
+}
+
+func TestOptimizeSQLForDialect(t *testing.T) {
+	in := `INSERT INTO users (id, name) VALUES (1, IFNULL(:name, 'x')) ON DUPLICATE KEY UPDATE name = IFNULL(:name, name)`
+	out, err := sqlparser.OptimizeSQLForDialect(in, sqlparser.DialectPostgres)
+	if err != nil {
+		t.Fatalf("optimize failed: %v", err)
+	}
+	if !out.Converted {
+		t.Fatalf("expected converted SQL")
+	}
+	if len(out.Actions) == 0 {
+		t.Fatalf("expected optimization actions")
 	}
 }

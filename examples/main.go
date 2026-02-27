@@ -62,10 +62,17 @@ func runSample(s sample) {
 	}
 	fmt.Printf("Parse : OK (%d statement(s))\n", len(stmts))
 	report := sqlparser.AnalyzeSQL(s.sql)
-	fmt.Printf("Analyze: %s\n", report.String())
+	fmt.Printf("Analyze (generic): %s\n", report.String())
 	for _, f := range report.Findings {
-		fmt.Printf("  - [%s] %s: %s (stmt %d)\n", f.Severity, f.Code, f.Message, f.StatementIndex)
+		fmt.Printf("  - [%s] %s (stmt %d)\n", f.Severity, f.Code, f.StatementIndex)
+		fmt.Printf("    Problem      : %s\n", f.Problem)
+		if strings.TrimSpace(f.Recommendation) != "" {
+			fmt.Printf("    Recommendation: %s\n", f.Recommendation)
+		}
 	}
+	runDialectAnalysis(s.sql, sqlparser.DialectMySQL, "MySQL")
+	runDialectAnalysis(s.sql, sqlparser.DialectPostgres, "PG")
+	runDialectAnalysis(s.sql, sqlparser.DialectSQLite, "SQLite")
 
 	mysql, err := sqlparser.ConvertDialect(s.sql, sqlparser.DialectMySQL)
 	if err != nil {
@@ -86,6 +93,31 @@ func runSample(s sample) {
 		fmt.Printf("SQLite: ERROR: %v\n", err)
 	} else {
 		fmt.Printf("SQLite: %s\n", compact(sqlite))
+	}
+}
+
+func runDialectAnalysis(sql string, dialect sqlparser.Dialect, label string) {
+	report := sqlparser.AnalyzeSQLWithOptions(sql, sqlparser.AnalysisOptions{Dialect: dialect})
+	fmt.Printf("Analyze (%s): %s\n", label, report.String())
+	for _, f := range report.Findings {
+		fmt.Printf("  - [%s] %s (stmt %d)\n", f.Severity, f.Code, f.StatementIndex)
+		fmt.Printf("    Problem      : %s\n", f.Problem)
+		if strings.TrimSpace(f.Recommendation) != "" {
+			fmt.Printf("    Recommendation: %s\n", f.Recommendation)
+		}
+	}
+	opt, err := sqlparser.OptimizeSQLForDialect(sql, dialect)
+	if err != nil {
+		fmt.Printf("Optimize (%s): ERROR: %v\n", label, err)
+		return
+	}
+	if opt.Converted {
+		fmt.Printf("Optimize (%s): converted SQL available (%d action(s))\n", label, len(opt.Actions))
+	} else {
+		fmt.Printf("Optimize (%s): no conversion needed (%d action(s))\n", label, len(opt.Actions))
+	}
+	for _, a := range opt.Actions {
+		fmt.Printf("  - Action: %s\n", a)
 	}
 }
 
