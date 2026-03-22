@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
+	"sync"
 	"unsafe"
 
 	"github.com/oarkflow/sqlparser/ast"
@@ -28,7 +29,7 @@ func (e *ParseError) Error() string {
 // Parser converts a stream of tokens into an AST.
 // It maintains a 2-token lookahead for decisions that require peeking ahead.
 type Parser struct {
-	lex     *lexer.Lexer
+	lex     lexer.Lexer // embedded, not pointer – avoids one heap alloc
 	tok     lexer.Token // current (already consumed from lexer)
 	peek    lexer.Token // one ahead
 	hasPeek bool
@@ -38,10 +39,16 @@ type Parser struct {
 	arena arena
 }
 
+// parserPool amortises Parser allocation for the convenience API
+// (ParseStatement / ParseStatements).
+var parserPool = sync.Pool{
+	New: func() any { return &Parser{} },
+}
+
 // New creates a Parser for the given SQL bytes.
 func New(src []byte) *Parser {
 	p := &Parser{}
-	p.lex = lexer.New(src)
+	p.lex.Init(src)
 	p.tok = p.lex.Next()
 	return p
 }
@@ -49,18 +56,14 @@ func New(src []byte) *Parser {
 // NewString creates a Parser for a SQL string.
 func NewString(src string) *Parser {
 	p := &Parser{}
-	p.lex = lexer.NewString(src)
+	p.lex.InitString(src)
 	p.tok = p.lex.Next()
 	return p
 }
 
 // Reset reuses the parser with new input, reusing internal memory.
 func (p *Parser) Reset(src []byte) {
-	if p.lex == nil {
-		p.lex = lexer.New(src)
-	} else {
-		p.lex.Reset(src)
-	}
+	p.lex.Init(src)
 	p.tok = p.lex.Next()
 	p.hasPeek = false
 	p.arena.reset()
@@ -99,14 +102,26 @@ func (p *Parser) ParseAll() ([]ast.Statement, error) {
 
 // ParseStatement is the public entrypoint for parsing a single statement.
 func ParseStatement(src string) (ast.Statement, error) {
-	p := NewString(src)
-	return p.ParseOne()
+	p := parserPool.Get().(*Parser)
+	p.lex.InitString(src)
+	p.tok = p.lex.Next()
+	p.hasPeek = false
+	p.arena.reset()
+	stmt, err := p.ParseOne()
+	parserPool.Put(p)
+	return stmt, err
 }
 
 // ParseStatements parses multiple statements.
 func ParseStatements(src string) ([]ast.Statement, error) {
-	p := NewString(src)
-	return p.ParseAll()
+	p := parserPool.Get().(*Parser)
+	p.lex.InitString(src)
+	p.tok = p.lex.Next()
+	p.hasPeek = false
+	p.arena.reset()
+	stmts, err := p.ParseAll()
+	parserPool.Put(p)
+	return stmts, err
 }
 
 // ---- internal helpers ----
@@ -176,11 +191,12 @@ func (p *Parser) tryEatKeyword(kw lexer.TokenType) bool {
 }
 
 func (p *Parser) errorf(format string, args ...any) *ParseError {
+	line, col := lexer.ComputeLineCol(p.lex.Source(), int(p.tok.Pos))
 	return &ParseError{
 		Msg:  fmt.Sprintf(format, args...),
 		Pos:  p.tok.Pos,
-		Line: p.tok.Line,
-		Col:  p.tok.Col,
+		Line: line,
+		Col:  col,
 	}
 }
 
@@ -2378,13 +2394,21 @@ func (p *Parser) parseIdent() (*ast.Ident, error) {
 	}
 }
 
+
 func (p *Parser) parseQualifiedIdent() (*ast.QualifiedIdent, error) {
 	id, err := p.parseIdent()
 	if err != nil {
 		return nil, err
 	}
-	var parts []*ast.Ident
-	parts = arenaAppend(&p.arena, parts, id)
+	// Fast path: single-part identifier (most common case)
+	if !p.is(lexer.DOT) {
+		parts := arenaMakeSlice[*ast.Ident](&p.arena, 1, 1)
+		parts[0] = id
+		return arenaNode(&p.arena, ast.QualifiedIdent{Parts: parts}), nil
+	}
+	// Multi-part: schema.table or schema.table.column
+	parts := arenaMakeSlice[*ast.Ident](&p.arena, 1, 3)
+	parts[0] = id
 	qi := arenaNode(&p.arena, ast.QualifiedIdent{Parts: parts})
 	for p.is(lexer.DOT) {
 		p.advance()

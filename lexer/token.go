@@ -4,7 +4,7 @@
 package lexer
 
 // TokenType identifies the type of a SQL token.
-type TokenType uint16
+type TokenType uint8
 
 const (
 	// Special tokens

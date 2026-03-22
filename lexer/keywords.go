@@ -1,18 +1,40 @@
 package lexer
 
 // keywords maps lowercase SQL keywords to their token types.
-// Uses a two-level lookup: first by length bucket, then by FNV hash
-// for O(1) average-case performance with zero allocations.
+// Uses a hash-map approach with FNV-1a for O(1) lookup with zero allocations.
 
-// kwEntry is a keyword table entry.
+// kwEntry is a keyword table entry in the hash map.
 type kwEntry struct {
 	word string
 	tok  TokenType
 }
 
-// Keywords organized by string length for fast dispatch.
-// The lexer lowercases the candidate before lookup.
-var keywordsByLen [32][]kwEntry
+// Hash map for keyword lookup. Size is a power of 2.
+const kwMapSize = 512 // must be power of 2
+const kwMapMask = kwMapSize - 1
+
+// Each slot holds a small bucket (typically 0-1 entries after hashing).
+var kwMap [kwMapSize][]kwEntry
+
+// fnv1a computes FNV-1a hash of bytes.
+func fnv1a(b []byte) uint32 {
+	h := uint32(2166136261)
+	for _, c := range b {
+		h ^= uint32(c)
+		h *= 16777619
+	}
+	return h
+}
+
+// fnv1aStr computes FNV-1a hash of a string without allocation.
+func fnv1aStr(s string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
 
 func init() {
 	words := []kwEntry{
@@ -155,10 +177,8 @@ func init() {
 		{"year", YEAR},
 	}
 	for _, e := range words {
-		l := len(e.word)
-		if l < len(keywordsByLen) {
-			keywordsByLen[l] = append(keywordsByLen[l], e)
-		}
+		h := fnv1aStr(e.word) & kwMapMask
+		kwMap[h] = append(kwMap[h], e)
 	}
 }
 
@@ -166,12 +186,13 @@ func init() {
 // val must be lowercase. This function performs zero allocations.
 func lookupKeyword(val []byte) TokenType {
 	l := len(val)
-	if l == 0 || l >= len(keywordsByLen) {
+	if l == 0 || l > 14 {
 		return IDENT
 	}
-	bucket := keywordsByLen[l]
+	h := fnv1a(val) & kwMapMask
+	bucket := kwMap[h]
 	for i := range bucket {
-		if bytesEqualString(val, bucket[i].word) {
+		if len(bucket[i].word) == l && bytesEqualString(val, bucket[i].word) {
 			return bucket[i].tok
 		}
 	}
@@ -182,7 +203,12 @@ func bytesEqualString(b []byte, s string) bool {
 	if len(b) != len(s) {
 		return false
 	}
-	for i := 0; i < len(b); i++ {
+	// Compare first and last bytes for early rejection
+	n := len(b)
+	if n > 0 && (b[0] != s[0] || b[n-1] != s[n-1]) {
+		return false
+	}
+	for i := 1; i < n-1; i++ {
 		if b[i] != s[i] {
 			return false
 		}

@@ -1,9 +1,6 @@
 package lexer
 
-import (
-	"unicode/utf8"
-	"unsafe"
-)
+import "unsafe"
 
 // Token represents a single SQL token. It holds a slice into the original
 // input to avoid copying bytes. All string data is borrowed from the source.
@@ -14,19 +11,17 @@ type Token struct {
 	Type TokenType
 	// Pos is the byte offset of the first character.
 	Pos int32
-	// Line and Col are 1-based source positions.
-	Line uint32
-	Col  uint32
 }
 
 // Lexer tokenizes SQL input with zero heap allocations per token.
 // It processes bytes directly and uses unsafe string conversion
 // to avoid allocations in keyword lookups.
+//
+// Line/column tracking is intentionally omitted from the hot path.
+// Use ComputeLineCol(pos) when needed (e.g. error reporting).
 type Lexer struct {
-	src  []byte
-	pos  int
-	line uint32
-	col  uint32
+	src []byte
+	pos int
 
 	// scratch is reused to build lowercased keyword candidates.
 	scratch [64]byte
@@ -34,296 +29,360 @@ type Lexer struct {
 
 // New creates a Lexer for the given SQL source.
 func New(src []byte) *Lexer {
-	return &Lexer{src: src, line: 1, col: 1}
+	return &Lexer{src: src}
 }
 
 // NewString creates a Lexer for a string input, avoiding a copy via unsafe.
 func NewString(src string) *Lexer {
-	// Convert string to []byte without copy using unsafe.
 	b := unsafe.Slice(unsafe.StringData(src), len(src))
-	return &Lexer{src: b, line: 1, col: 1}
+	return &Lexer{src: b}
+}
+
+// Init initialises a Lexer in-place (for embedded use, avoids heap alloc).
+func (l *Lexer) Init(src []byte) {
+	l.src = src
+	l.pos = 0
+}
+
+// InitString initialises a Lexer in-place from a string.
+func (l *Lexer) InitString(src string) {
+	l.src = unsafe.Slice(unsafe.StringData(src), len(src))
+	l.pos = 0
 }
 
 // Reset reuses the lexer with new source, avoiding allocating a new lexer.
 func (l *Lexer) Reset(src []byte) {
 	l.src = src
 	l.pos = 0
-	l.line = 1
-	l.col = 1
+}
+
+// Source returns the underlying source bytes.
+func (l *Lexer) Source() []byte { return l.src }
+
+// ComputeLineCol calculates 1-based line and column for a given byte offset.
+// This is intentionally off the hot path; call only for error reporting.
+func ComputeLineCol(src []byte, pos int) (line, col uint32) {
+	line = 1
+	col = 1
+	if pos > len(src) {
+		pos = len(src)
+	}
+	for i := 0; i < pos; i++ {
+		if src[i] == '\n' {
+			line++
+			col = 1
+		} else {
+			col++
+		}
+	}
+	return
+}
+
+// Byte dispatch categories for the lexer's hot loop.
+// Using a table avoids branch-heavy switch and improves branch prediction.
+const (
+	cOther byte = iota // default: punctuation, ILLEGAL
+	cSpace             // ' ', '\t', '\v', '\f'
+	cNewL              // '\n'
+	cCR                // '\r'
+	cAlpha             // a-z, A-Z, _
+	cDigit             // 0-9
+	cDot               // '.'
+	cSQ                // '\''
+	cDQ                // '"'
+	cBT                // '`'
+	cDash              // '-'
+	cSlash             // '/'
+	cHash              // '#'
+)
+
+var charClass [256]byte
+
+func init() {
+	charClass[' '] = cSpace
+	charClass['\t'] = cSpace
+	charClass['\v'] = cSpace
+	charClass['\f'] = cSpace
+	charClass['\n'] = cNewL
+	charClass['\r'] = cCR
+	for c := byte('a'); c <= 'z'; c++ {
+		charClass[c] = cAlpha
+	}
+	for c := byte('A'); c <= 'Z'; c++ {
+		charClass[c] = cAlpha
+	}
+	charClass['_'] = cAlpha
+	for c := byte('0'); c <= '9'; c++ {
+		charClass[c] = cDigit
+	}
+	charClass['.'] = cDot
+	charClass['\''] = cSQ
+	charClass['"'] = cDQ
+	charClass['`'] = cBT
+	charClass['-'] = cDash
+	charClass['/'] = cSlash
+	charClass['#'] = cHash
 }
 
 // Next returns the next token from the input. Returns EOF when exhausted.
 // This function never allocates on the heap; all returned Token.Raw slices
 // are sub-slices of the original source.
 func (l *Lexer) Next() Token {
-	for l.pos < len(l.src) {
-		start := l.pos
-		startLine := l.line
-		startCol := l.col
-		b := l.src[l.pos]
+	src := l.src
+	pos := l.pos
+	n := len(src)
 
-		switch {
-		case b == '\n':
-			l.pos++
-			l.line++
-			l.col = 1
-			// continue without returning – skip whitespace
+	for pos < n {
+		start := pos
+		b := src[pos]
 
-		case b == '\r':
-			l.pos++
-			if l.pos < len(l.src) && l.src[l.pos] == '\n' {
-				l.pos++
+		switch charClass[b] {
+		case cNewL:
+			pos++
+			continue
+
+		case cCR:
+			pos++
+			if pos < n && src[pos] == '\n' {
+				pos++
 			}
-			l.line++
-			l.col = 1
+			continue
 
-		case isSpace(b):
-			l.pos++
-			l.col++
-			for l.pos < len(l.src) && isSpace(l.src[l.pos]) {
-				if l.src[l.pos] == '\n' {
-					break
+		case cSpace:
+			pos++
+			for pos < n && isSpaceTab[src[pos]] {
+				pos++
+			}
+			continue
+
+		case cDash:
+			if pos+1 < n && src[pos+1] == '-' {
+				// Single-line comment --
+				pos += 2
+				for pos < n && src[pos] != '\n' {
+					pos++
 				}
-				l.pos++
-				l.col++
+				continue
 			}
-			// skip whitespace silently
+			// Might be -> or ->> or just -
+			l.pos = pos
+			return l.lexPunct(start)
 
-		case b == '-' && l.pos+1 < len(l.src) && l.src[l.pos+1] == '-':
-			// Single-line comment --
-			l.pos += 2
-			l.col += 2
-			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
-				l.pos++
-				l.col++
-			}
-			// skip comment
-
-		case b == '#':
-			// PostgreSQL JSON operators #> and #>> must be tokenized as punctuation.
-			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '>' {
-				return l.lexPunct(start, startLine, startCol)
+		case cHash:
+			if pos+1 < n && src[pos+1] == '>' {
+				l.pos = pos
+				return l.lexPunct(start)
 			}
 			// MySQL hash comment
-			l.pos++
-			l.col++
-			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
-				l.pos++
-				l.col++
+			pos++
+			for pos < n && src[pos] != '\n' {
+				pos++
 			}
+			continue
 
-		case b == '/' && l.pos+1 < len(l.src) && l.src[l.pos+1] == '*':
-			// Block comment /* ... */
-			l.pos += 2
-			l.col += 2
-			for l.pos+1 < len(l.src) {
-				if l.src[l.pos] == '\n' {
-					l.line++
-					l.col = 1
-					l.pos++
-				} else if l.src[l.pos] == '*' && l.src[l.pos+1] == '/' {
-					l.pos += 2
-					l.col += 2
-					break
-				} else {
-					l.pos++
-					l.col++
+		case cSlash:
+			if pos+1 < n && src[pos+1] == '*' {
+				// Block comment /* ... */
+				pos += 2
+				for pos+1 < n {
+					if src[pos] == '*' && src[pos+1] == '/' {
+						pos += 2
+						break
+					}
+					pos++
+				}
+				continue
+			}
+			l.pos = pos
+			return l.lexPunct(start)
+
+		case cDigit:
+			// Check for 0x hex literal
+			if b == '0' && pos+1 < n && (src[pos+1] == 'x' || src[pos+1] == 'X') {
+				l.pos = pos
+				return l.lexHex0x(start)
+			}
+			l.pos = pos
+			return l.lexNumber(start)
+
+		case cDot:
+			if pos+1 < n && src[pos+1] >= '0' && src[pos+1] <= '9' {
+				l.pos = pos
+				return l.lexNumber(start)
+			}
+			l.pos = pos
+			return l.lexPunct(start)
+
+		case cSQ:
+			l.pos = pos
+			return l.lexQuoted(start, '\'', STRING)
+
+		case cDQ:
+			l.pos = pos
+			return l.lexQuoted(start, '"', DQUOTE)
+
+		case cBT:
+			l.pos = pos
+			return l.lexQuoted(start, '`', BACKTICK)
+
+		case cAlpha:
+			// Check for hex/bit string literals: x'...' X'...' b'...' B'...'
+			if pos+1 < n && src[pos+1] == '\'' {
+				if b == 'x' || b == 'X' {
+					l.pos = pos
+					return l.lexHexLit(start)
+				}
+				if b == 'b' || b == 'B' {
+					l.pos = pos
+					return l.lexBitLit(start)
 				}
 			}
-
-		case isDigit(b) || (b == '.' && l.pos+1 < len(l.src) && isDigit(l.src[l.pos+1])):
-			return l.lexNumber(start, startLine, startCol)
-
-		case b == '\'':
-			return l.lexQuoted(start, startLine, startCol, '\'', STRING)
-
-		case b == '"':
-			return l.lexQuoted(start, startLine, startCol, '"', DQUOTE)
-
-		case b == '`':
-			return l.lexQuoted(start, startLine, startCol, '`', BACKTICK)
-
-		case b == 'x' || b == 'X':
-			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '\'' {
-				return l.lexHexLit(start, startLine, startCol)
-			}
-			return l.lexIdent(start, startLine, startCol)
-
-		case b == 'b' || b == 'B':
-			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '\'' {
-				return l.lexBitLit(start, startLine, startCol)
-			}
-			return l.lexIdent(start, startLine, startCol)
-
-		case b == '0' && l.pos+1 < len(l.src) && (l.src[l.pos+1] == 'x' || l.src[l.pos+1] == 'X'):
-			return l.lexHex0x(start, startLine, startCol)
-
-		case isAlpha(b) || b == '_':
-			return l.lexIdent(start, startLine, startCol)
+			l.pos = pos
+			return l.lexIdent(start)
 
 		default:
-			return l.lexPunct(start, startLine, startCol)
+			l.pos = pos
+			return l.lexPunct(start)
 		}
-
-		// consumed whitespace/comment, restart
-		_ = startLine
-		_ = startCol
 	}
-	return Token{Type: EOF, Pos: int32(l.pos), Line: l.line, Col: l.col}
+	l.pos = pos
+	return Token{Type: EOF, Pos: int32(pos)}
 }
 
 // lexIdent scans an identifier or keyword.
-func (l *Lexer) lexIdent(start int, line, col uint32) Token {
-	l.pos++
-	l.col++
-	for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
-		l.pos++
-		l.col++
+func (l *Lexer) lexIdent(start int) Token {
+	src := l.src
+	pos := l.pos + 1
+	n := len(src)
+	for pos < n && identContTable[src[pos]] {
+		pos++
 	}
-	raw := l.src[start:l.pos]
+	l.pos = pos
+	raw := src[start:pos]
 
 	// Lowercase into scratch for keyword lookup (no heap alloc for <=64 bytes).
-	n := len(raw)
-	if n > len(l.scratch) {
-		// Longer than scratch – cannot be a keyword (all keywords ≤ 14 chars).
-		return Token{Type: IDENT, Raw: raw, Pos: int32(start), Line: line, Col: col}
+	kwLen := len(raw)
+	if kwLen > 14 {
+		// All SQL keywords are <= 14 chars
+		return Token{Type: IDENT, Raw: raw, Pos: int32(start)}
 	}
-	for i, c := range raw {
+	scratch := &l.scratch
+	for i := 0; i < kwLen; i++ {
+		c := raw[i]
 		if c >= 'A' && c <= 'Z' {
-			l.scratch[i] = c + 32
+			scratch[i] = c + 32
 		} else {
-			l.scratch[i] = c
+			scratch[i] = c
 		}
 	}
-	tok := lookupKeyword(l.scratch[:n])
-	return Token{Type: tok, Raw: raw, Pos: int32(start), Line: line, Col: col}
+	tok := lookupKeyword(scratch[:kwLen])
+	return Token{Type: tok, Raw: raw, Pos: int32(start)}
 }
 
 // lexNumber scans integer or float literals.
-func (l *Lexer) lexNumber(start int, line, col uint32) Token {
+func (l *Lexer) lexNumber(start int) Token {
+	src := l.src
+	pos := l.pos
+	n := len(src)
 	typ := INT
-	for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
-		l.pos++
-		l.col++
+	for pos < n && src[pos] >= '0' && src[pos] <= '9' {
+		pos++
 	}
-	if l.pos < len(l.src) && l.src[l.pos] == '.' {
+	if pos < n && src[pos] == '.' {
 		typ = FLOAT
-		l.pos++
-		l.col++
-		for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
-			l.pos++
-			l.col++
+		pos++
+		for pos < n && src[pos] >= '0' && src[pos] <= '9' {
+			pos++
 		}
 	}
 	// optional exponent
-	if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
+	if pos < n && (src[pos] == 'e' || src[pos] == 'E') {
 		typ = FLOAT
-		l.pos++
-		l.col++
-		if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
-			l.pos++
-			l.col++
+		pos++
+		if pos < n && (src[pos] == '+' || src[pos] == '-') {
+			pos++
 		}
-		for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
-			l.pos++
-			l.col++
+		for pos < n && src[pos] >= '0' && src[pos] <= '9' {
+			pos++
 		}
 	}
-	return Token{Type: TokenType(typ), Raw: l.src[start:l.pos], Pos: int32(start), Line: line, Col: col}
+	l.pos = pos
+	return Token{Type: TokenType(typ), Raw: src[start:pos], Pos: int32(start)}
 }
 
 // lexQuoted scans a single, double, or backtick quoted string.
-func (l *Lexer) lexQuoted(start int, line, col uint32, delim byte, typ TokenType) Token {
-	l.pos++ // skip opening delimiter
-	l.col++
-	for l.pos < len(l.src) {
-		c := l.src[l.pos]
+func (l *Lexer) lexQuoted(start int, delim byte, typ TokenType) Token {
+	src := l.src
+	pos := l.pos + 1 // skip opening delimiter
+	n := len(src)
+	for pos < n {
+		c := src[pos]
 		if c == delim {
-			l.pos++
-			l.col++
+			pos++
 			// doubled delimiter is an escape (e.g. '' or "")
-			if l.pos < len(l.src) && l.src[l.pos] == delim {
-				l.pos++
-				l.col++
+			if pos < n && src[pos] == delim {
+				pos++
 				continue
 			}
 			break
 		}
 		if c == '\\' && delim != '`' {
-			l.pos++
-			l.col++
-			if l.pos < len(l.src) {
-				l.pos++
-				l.col++
+			pos++
+			if pos < n {
+				pos++
 			}
 			continue
 		}
-		if c == '\n' {
-			l.line++
-			l.col = 1
-			l.pos++
-			continue
-		}
-		if c >= 0x80 {
-			// Multi-byte UTF-8: skip the full rune.
-			_, size := utf8.DecodeRune(l.src[l.pos:])
-			l.pos += size
-			l.col++
-			continue
-		}
-		l.pos++
-		l.col++
+		pos++
 	}
-	return Token{Type: typ, Raw: l.src[start:l.pos], Pos: int32(start), Line: line, Col: col}
+	l.pos = pos
+	return Token{Type: typ, Raw: src[start:pos], Pos: int32(start)}
 }
 
-func (l *Lexer) lexHexLit(start int, line, col uint32) Token {
-	l.pos++ // x
-	l.col++
-	l.pos++ // '
-	l.col++
-	for l.pos < len(l.src) && l.src[l.pos] != '\'' {
-		l.pos++
-		l.col++
+func (l *Lexer) lexHexLit(start int) Token {
+	src := l.src
+	pos := l.pos + 2 // skip x'
+	n := len(src)
+	for pos < n && src[pos] != '\'' {
+		pos++
 	}
-	if l.pos < len(l.src) {
-		l.pos++ // closing '
-		l.col++
+	if pos < n {
+		pos++ // closing '
 	}
-	return Token{Type: HEXLIT, Raw: l.src[start:l.pos], Pos: int32(start), Line: line, Col: col}
+	l.pos = pos
+	return Token{Type: HEXLIT, Raw: src[start:pos], Pos: int32(start)}
 }
 
-func (l *Lexer) lexHex0x(start int, line, col uint32) Token {
-	l.pos += 2 // 0x
-	l.col += 2
-	for l.pos < len(l.src) && isHexDigit(l.src[l.pos]) {
-		l.pos++
-		l.col++
+func (l *Lexer) lexHex0x(start int) Token {
+	src := l.src
+	pos := l.pos + 2 // 0x
+	n := len(src)
+	for pos < n && isHexDigit(src[pos]) {
+		pos++
 	}
-	return Token{Type: HEXLIT, Raw: l.src[start:l.pos], Pos: int32(start), Line: line, Col: col}
+	l.pos = pos
+	return Token{Type: HEXLIT, Raw: src[start:pos], Pos: int32(start)}
 }
 
-func (l *Lexer) lexBitLit(start int, line, col uint32) Token {
-	l.pos++ // b/B
-	l.col++
-	return l.lexQuoted(l.pos-1, line, col, '\'', BITLIT)
+func (l *Lexer) lexBitLit(start int) Token {
+	l.pos++ // skip b/B
+	return l.lexQuoted(l.pos-1, '\'', BITLIT)
 }
 
 // lexPunct handles single and multi-character punctuation/operators.
-func (l *Lexer) lexPunct(start int, line, col uint32) Token {
-	b := l.src[l.pos]
+func (l *Lexer) lexPunct(start int) Token {
+	src := l.src
+	b := src[l.pos]
 	l.pos++
-	l.col++
 
 	peek := func() byte {
-		if l.pos < len(l.src) {
-			return l.src[l.pos]
+		if l.pos < len(src) {
+			return src[l.pos]
 		}
 		return 0
 	}
 	advance := func() {
 		l.pos++
-		l.col++
 	}
 
 	var typ TokenType
@@ -444,8 +503,8 @@ func (l *Lexer) lexPunct(start int, line, col uint32) Token {
 		}
 	case ':':
 		// named parameter :name
-		if isAlpha(peek()) || peek() == '_' {
-			for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
+		if p := peek(); isAlphaB(p) || p == '_' {
+			for l.pos < len(src) && identContTable[src[l.pos]] {
 				advance()
 			}
 			typ = NAMEDPARAM
@@ -453,11 +512,12 @@ func (l *Lexer) lexPunct(start int, line, col uint32) Token {
 			typ = COLON
 		}
 	case '@':
-		if peek() == '>' {
+		p := peek()
+		if p == '>' {
 			advance()
 			typ = ATGT
-		} else if isAlpha(peek()) || peek() == '_' || peek() == '@' {
-			for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
+		} else if isAlphaB(p) || p == '_' || p == '@' {
+			for l.pos < len(src) && identContTable[src[l.pos]] {
 				advance()
 			}
 			typ = NAMEDPARAM
@@ -465,13 +525,14 @@ func (l *Lexer) lexPunct(start int, line, col uint32) Token {
 			typ = AT
 		}
 	case '$':
-		if isDigit(peek()) {
-			for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+		p := peek()
+		if p >= '0' && p <= '9' {
+			for l.pos < len(src) && src[l.pos] >= '0' && src[l.pos] <= '9' {
 				advance()
 			}
 			typ = NAMEDPARAM
-		} else if isAlpha(peek()) || peek() == '_' {
-			for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
+		} else if isAlphaB(p) || p == '_' {
+			for l.pos < len(src) && identContTable[src[l.pos]] {
 				advance()
 			}
 			typ = NAMEDPARAM
@@ -493,14 +554,12 @@ func (l *Lexer) lexPunct(start int, line, col uint32) Token {
 	default:
 		typ = ILLEGAL
 	}
-	return Token{Type: typ, Raw: l.src[start:l.pos], Pos: int32(start), Line: line, Col: col}
+	return Token{Type: typ, Raw: src[start:l.pos], Pos: int32(start)}
 }
 
 // ---- character classification tables (no function call overhead) ----
 
 var isSpaceTab = [256]bool{' ': true, '\t': true, '\v': true, '\f': true}
-
-func isSpace(c byte) bool { return isSpaceTab[c] }
 
 var identContTable [256]bool
 
@@ -518,18 +577,15 @@ func init() {
 	identContTable['$'] = true
 }
 
-func isIdentCont(c byte) bool { return identContTable[c] }
-func isAlpha(c byte) bool     { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' }
-func isDigit(c byte) bool     { return c >= '0' && c <= '9' }
+func isAlphaB(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' }
 func isHexDigit(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
-// Tokenize is a convenience function that lexes all tokens from src
-// into a pre-allocated slice (caller provides buffer to avoid alloc).
+// Tokenize breaks SQL source into tokens. Provide a pre-allocated buf to avoid allocation.
 func Tokenize(src []byte, buf []Token) []Token {
 	buf = buf[:0]
-	l := New(src)
+	l := Lexer{src: src}
 	for {
 		t := l.Next()
 		buf = append(buf, t)

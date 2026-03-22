@@ -535,3 +535,37 @@ func BenchmarkParseStatementString(b *testing.B) {
 		}
 	}
 }
+
+var benchSimple = `SELECT id, name FROM users WHERE id = 1`
+
+func BenchmarkParseSimpleSelect(b *testing.B) {
+	src := []byte(benchSimple)
+	p := sqlparser.New(src)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Reset(src)
+		_, err := p.Next()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+var benchInsert = `INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')`
+
+func BenchmarkParseInsert(b *testing.B) {
+	src := []byte(benchInsert)
+	p := sqlparser.New(src)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Reset(src)
+		_, err := p.Next()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
