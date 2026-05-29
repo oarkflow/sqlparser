@@ -1,6 +1,10 @@
 # sqlparser — High-Performance SQL Parser for Go
 
-A **zero-allocation**, production-grade SQL parser written in Go, designed for maximum throughput, minimal latency, and zero GC pressure.
+A **zero-allocation hot-path** SQL parser written in Go, designed for high throughput, low latency, and production use over a documented MySQL/PostgreSQL-oriented SQL subset.
+
+The parser has two modes:
+- **Fast AST mode** (`ParseStatement`, `ParseStatements`, reusable `Parser`) skips trivia and is optimized for warmed zero-allocation parsing.
+- **Lossless document mode** (`ParseDocument`) preserves whitespace, comments, tokens, and statement source spans for exact round-tripping.
 
 ---
 
@@ -33,6 +37,18 @@ Simple SELECT/INSERT queries parse in **under 300ns** with zero allocations on a
 
 ---
 
+## Production Support Contract
+
+This project is production-ready for the documented parser surface below. It is not a full semantic clone of every database engine.
+
+| Level | Meaning |
+|---|---|
+| Fully modeled | Parsed into dedicated AST nodes and rendered/analyzed by public APIs. |
+| Structured/raw fallback | Accepted and source-preserved, but internals may be dialect-specific and not fully analyzed. |
+| Unsupported | Returns a parse error unless represented by a generic fallback. |
+
+Use `ParseOptions` for untrusted SQL: set `MaxBytes`, `MaxTokens`, `MaxDepth`, `MaxStatements`, and set `AllowGenericDDL` according to your policy. Use `ConvertOptions{Strict:true}` when conversion must fail instead of rendering best-effort fallback SQL.
+
 ## SQL Coverage
 
 ### DML
@@ -40,14 +56,19 @@ Simple SELECT/INSERT queries parse in **under 300ns** with zero allocations on a
 - `FROM` — simple tables, subqueries, aliases
 - `JOIN` — INNER, LEFT, RIGHT, FULL, CROSS, NATURAL with ON / USING
 - `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`
+- `DISTINCT ON`, `FILTER`, `OVER`, named `WINDOW`, `NULLS FIRST/LAST`
+- `LATERAL`, `VALUES` table sources, qualified `table.*`, alias column lists
+- `FOR UPDATE` / lock clauses
 - `UNION`, `INTERSECT`, `EXCEPT` (with `ALL`)
 - Common Table Expressions (`WITH [RECURSIVE] ...`)
 - Subqueries (scalar, `IN`, `EXISTS`, `FROM`)
 - `INSERT INTO ... VALUES`, `INSERT INTO ... SELECT`
+- `INSERT ... SET`, `DEFAULT VALUES`, `RETURNING`
 - `INSERT ... ON DUPLICATE KEY UPDATE`
+- `INSERT ... ON CONFLICT ... WHERE ... DO UPDATE/NOTHING`
 - `REPLACE INTO`
-- `UPDATE ... SET ... WHERE`
-- `DELETE FROM ... WHERE`
+- `UPDATE ... SET ... WHERE ... RETURNING`
+- `DELETE FROM ... WHERE ... RETURNING`, MySQL multi-table delete
 
 ### DDL
 - `CREATE TABLE` (columns, constraints, options)
@@ -55,8 +76,10 @@ Simple SELECT/INSERT queries parse in **under 300ns** with zero allocations on a
 - `CREATE TABLE ... LIKE`
 - `CREATE TABLE ... AS SELECT`
 - `CREATE [UNIQUE] INDEX`
-- `CREATE [OR REPLACE] VIEW`
-- `ALTER TABLE` — ADD/DROP/MODIFY COLUMN, ADD CONSTRAINT, DROP INDEX, RENAME
+- `CREATE [OR REPLACE] VIEW`, materialized views
+- Generated and identity columns
+- `CREATE/DROP FUNCTION`, `PROCEDURE`, `TRIGGER`, `SEQUENCE` as structured object DDL with raw body preservation
+- `ALTER TABLE` — ADD/DROP/MODIFY/ALTER COLUMN, ADD/DROP CONSTRAINT, DROP INDEX, RENAME
 - `DROP TABLE [IF EXISTS]`
 - `DROP INDEX`
 - `TRUNCATE TABLE`
@@ -66,6 +89,7 @@ Simple SELECT/INSERT queries parse in **under 300ns** with zero allocations on a
 - `SHOW TABLES / DATABASES [LIKE ...]`
 - `EXPLAIN <statement>`
 - Multi-statement parsing (`;` separated)
+- Lossless document parsing with comments/whitespace preserved
 
 ### Expressions
 - Arithmetic: `+`, `-`, `*`, `/`, `%`
@@ -130,6 +154,29 @@ for _, s := range stmts {
 }
 ```
 
+### Parse losslessly
+
+```go
+doc, err := sqlparser.ParseDocumentString("/* keep */ SELECT  1;\n")
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(doc.SQL())              // exact original SQL
+fmt.Println(doc.Statements[0].SQL()) // exact original statement slice
+```
+
+### Parse untrusted SQL with guardrails
+
+```go
+stmts, err := sqlparser.ParseStatementsWithOptions(sql, sqlparser.ParseOptions{
+    MaxBytes:       1 << 20,
+    MaxTokens:      100_000,
+    MaxDepth:       256,
+    MaxStatements:  1_000,
+    AllowGenericDDL: false,
+})
+```
+
 ### Reuse a parser (best performance)
 
 ```go
@@ -163,6 +210,8 @@ if err != nil {
 }
 fmt.Println(converted)
 ```
+
+Set `Strict:true` when fallback DDL or unsupported conversion paths should return an error instead of best-effort SQL.
 
 ### Analyze SQL validity and optimization hints
 
@@ -201,7 +250,7 @@ sqlparser/
 
 ### Keyword Lookup
 
-Keywords are organized in a `[32][26][]kwEntry` array indexed by `(keyword_length, first_char - 'a')`. This two-level dispatch reduces average bucket size to ~1 entry, making keyword lookup effectively O(1) with a single string comparison. No hashing, no heap allocation.
+Keywords use a compact hash-bucket lookup with no heap allocation on the lexer hot path.
 
 ### Expression Parser (Pratt)
 

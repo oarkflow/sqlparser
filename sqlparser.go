@@ -5,15 +5,14 @@
 //   - O(1) keyword recognition via length-bucketed tables
 //   - Pratt (top-down operator precedence) expression parser
 //   - Arena allocator eliminates per-node GC pressure
-//   - Supports MySQL, PostgreSQL, SQLite, and standard SQL dialects
-//   - Full DDL + DML coverage
+//   - Supports a documented MySQL/PostgreSQL-oriented SQL subset
+//   - Lossless document parsing for exact source preservation
 //
 // Usage:
 //
 //	stmt, err := sqlparser.ParseStatement("SELECT id, name FROM users WHERE id = 1")
 //	stmts, err := sqlparser.ParseStatements(sql)
-//	p := sqlparser.NewParser(src)
-//	for stmt := range p.Iter() { ... }
+//	doc, err := sqlparser.ParseDocumentString(sql)
 package sqlparser
 
 import (
@@ -40,6 +39,9 @@ type (
 	TransactionStmt    = ast.TransactionStmt
 	GenericDDLStmt     = ast.GenericDDLStmt
 	ObjectDDLStmt      = ast.ObjectDDLStmt
+	ParseOptions       = parser.ParseOptions
+	Document           = parser.Document
+	StatementSpan      = parser.StatementSpan
 	ParseError         = parser.ParseError
 	Token              = lexer.Token
 	TokenType          = lexer.TokenType
@@ -54,6 +56,21 @@ func ParseStatement(sql string) (Statement, error) {
 // ParseStatements parses multiple semicolon-separated SQL statements.
 func ParseStatements(sql string) ([]Statement, error) {
 	return parser.ParseStatements(sql)
+}
+
+// ParseStatementsWithOptions parses semicolon-separated SQL with guardrails.
+func ParseStatementsWithOptions(sql string, opts ParseOptions) ([]Statement, error) {
+	return parser.ParseStatementsWithOptions(sql, opts)
+}
+
+// ParseDocument parses SQL while preserving whitespace, comments, and exact spans.
+func ParseDocument(src []byte, opts ...ParseOptions) (*Document, error) {
+	return parser.ParseDocument(src, opts...)
+}
+
+// ParseDocumentString parses SQL text while preserving whitespace, comments, and exact spans.
+func ParseDocumentString(src string, opts ...ParseOptions) (*Document, error) {
+	return parser.ParseDocumentString(src, opts...)
 }
 
 // Parser is a reusable, stateful SQL parser.
@@ -95,4 +112,9 @@ func (p *Parser) All() ([]Statement, error) {
 //	tokens := sqlparser.Tokenize([]byte(sql), buf)
 func Tokenize(src []byte, buf []Token) []Token {
 	return lexer.Tokenize(src, buf)
+}
+
+// TokenizeAll breaks SQL into tokens including whitespace and comments.
+func TokenizeAll(src []byte, buf []Token) []Token {
+	return lexer.TokenizeAll(src, buf)
 }

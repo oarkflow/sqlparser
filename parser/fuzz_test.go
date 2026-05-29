@@ -1,6 +1,8 @@
 package parser_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	sqlparser "github.com/oarkflow/sqlparser"
@@ -35,9 +37,42 @@ func FuzzParser(f *testing.F) {
 	for _, s := range seeds {
 		f.Add(s)
 	}
+	for _, path := range exampleSQLPaths() {
+		if b, err := os.ReadFile(path); err == nil {
+			f.Add(string(b))
+		}
+	}
 
 	f.Fuzz(func(t *testing.T, sql string) {
 		// We don't care about errors, only panics
 		sqlparser.ParseStatements(sql)
 	})
+}
+
+func FuzzParseDocument(f *testing.F) {
+	for _, path := range exampleSQLPaths() {
+		if b, err := os.ReadFile(path); err == nil {
+			f.Add(string(b))
+		}
+	}
+	f.Add("/* keep */ SELECT 1;\nCREATE FUNCTION f AS 'select 1';")
+	f.Fuzz(func(t *testing.T, sql string) {
+		doc, err := sqlparser.ParseDocumentString(sql)
+		if err != nil {
+			return
+		}
+		if doc.SQL() != sql {
+			t.Fatalf("document SQL mismatch")
+		}
+		for _, span := range doc.Statements {
+			if span.Start < 0 || span.End < span.Start || int(span.End) > len(sql) {
+				t.Fatalf("invalid span: %#v", span)
+			}
+		}
+	})
+}
+
+func exampleSQLPaths() []string {
+	paths, _ := filepath.Glob("../examples/sql/*.sql")
+	return paths
 }

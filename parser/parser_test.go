@@ -537,6 +537,7 @@ func TestExampleSQLRegression(t *testing.T) {
 		"../examples/sql/11_advanced_select_window_lateral.sql",
 		"../examples/sql/12_dml_returning_and_defaults.sql",
 		"../examples/sql/13_object_ddl_generated_alter.sql",
+		"../examples/sql/14_production_migration_comments.sql",
 	} {
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -786,6 +787,28 @@ func BenchmarkParseEachExampleSQL(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkParseDocumentAllExampleSQL(b *testing.B) {
+	inputs := loadExampleSQLBenchInputs(b)
+	var totalBytes int64
+	for _, in := range inputs {
+		totalBytes += int64(len(in.src))
+	}
+	b.SetBytes(totalBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, in := range inputs {
+			doc, err := sqlparser.ParseDocument(in.src)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(doc.Statements) == 0 {
+				b.Fatal("expected statements")
+			}
+		}
 	}
 }
 

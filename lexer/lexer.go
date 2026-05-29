@@ -249,6 +249,75 @@ func (l *Lexer) Next() Token {
 	return Token{Type: EOF, Pos: int32(pos)}
 }
 
+// NextAll returns the next token including whitespace and comments. It is used
+// by lossless/document parsing; Next remains the hot trivia-skipping path.
+func (l *Lexer) NextAll() Token {
+	src := l.src
+	pos := l.pos
+	n := len(src)
+	if pos >= n {
+		l.pos = pos
+		return Token{Type: EOF, Pos: int32(pos)}
+	}
+	start := pos
+	b := src[pos]
+	switch charClass[b] {
+	case cNewL:
+		pos++
+		l.pos = pos
+		return Token{Type: WHITESPACE, Raw: src[start:pos], Pos: int32(start)}
+	case cCR:
+		pos++
+		if pos < n && src[pos] == '\n' {
+			pos++
+		}
+		l.pos = pos
+		return Token{Type: WHITESPACE, Raw: src[start:pos], Pos: int32(start)}
+	case cSpace:
+		pos++
+		for pos < n && isSpaceTab[src[pos]] {
+			pos++
+		}
+		l.pos = pos
+		return Token{Type: WHITESPACE, Raw: src[start:pos], Pos: int32(start)}
+	case cDash:
+		if pos+1 < n && src[pos+1] == '-' {
+			pos += 2
+			for pos < n && src[pos] != '\n' {
+				pos++
+			}
+			l.pos = pos
+			return Token{Type: COMMENT, Raw: src[start:pos], Pos: int32(start)}
+		}
+	case cHash:
+		if pos+1 >= n || src[pos+1] != '>' {
+			pos++
+			for pos < n && src[pos] != '\n' {
+				pos++
+			}
+			l.pos = pos
+			return Token{Type: COMMENT, Raw: src[start:pos], Pos: int32(start)}
+		}
+	case cSlash:
+		if pos+1 < n && src[pos+1] == '*' {
+			pos += 2
+			for pos+1 < n {
+				if src[pos] == '*' && src[pos+1] == '/' {
+					pos += 2
+					break
+				}
+				pos++
+			}
+			if pos >= n {
+				pos = n
+			}
+			l.pos = pos
+			return Token{Type: COMMENT, Raw: src[start:pos], Pos: int32(start)}
+		}
+	}
+	return l.Next()
+}
+
 // lexIdent scans an identifier or keyword.
 func (l *Lexer) lexIdent(start int) Token {
 	src := l.src
@@ -588,6 +657,21 @@ func Tokenize(src []byte, buf []Token) []Token {
 	l := Lexer{src: src}
 	for {
 		t := l.Next()
+		buf = append(buf, t)
+		if t.Type == EOF {
+			break
+		}
+	}
+	return buf
+}
+
+// TokenizeAll breaks SQL source into tokens including whitespace and comments.
+// Provide a pre-allocated buf to control allocations.
+func TokenizeAll(src []byte, buf []Token) []Token {
+	buf = buf[:0]
+	l := Lexer{src: src}
+	for {
+		t := l.NextAll()
 		buf = append(buf, t)
 		if t.Type == EOF {
 			break

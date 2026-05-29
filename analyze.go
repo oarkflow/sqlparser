@@ -174,6 +174,10 @@ func analyzeStatement(stmt Statement, idx int, report *AnalysisReport, opts Anal
 		}
 	case *ast.GenericDDLStmt:
 		addFinding(report, SeverityWarning, "GENERIC_DDL", "Statement was parsed with generic DDL fallback, so internals may not be fully analyzed.", "For best validation, rewrite this statement to a currently modeled form or extend parser support for this DDL type.", idx)
+	case *ast.ObjectDDLStmt:
+		if len(s.Body) > 0 {
+			addFinding(report, SeverityInfo, "OBJECT_DDL_RAW_BODY", "Object DDL body was preserved as raw SQL.", "Use strict conversion or statement-specific validation before applying routine/trigger/function bodies in production.", idx)
+		}
 	case *ast.UseStmt:
 		if opts.Dialect == DialectPostgres || opts.Dialect == DialectSQLite {
 			addFinding(report, SeverityWarning, "USE_NOT_SUPPORTED", "USE statement is not portable to this dialect.", "For PostgreSQL use explicit database connection; for SQLite use file/database handle selection in the client.", idx)
@@ -220,6 +224,12 @@ func analyzeExpr(e Expr, idx int, report *AnalysisReport, opts AnalysisOptions) 
 		}
 		for _, a := range ex.Args {
 			analyzeExpr(a, idx, report, opts)
+		}
+		if ex.Filter != nil {
+			analyzeExpr(ex.Filter, idx, report, opts)
+		}
+		if ex.Over != nil && len(ex.Over.Raw) > 0 {
+			addFinding(report, SeverityInfo, "RAW_WINDOW_FRAME", "Window frame details were preserved as raw SQL.", "Review dialect-specific window frame syntax when converting across databases.", idx)
 		}
 	case *ast.CaseExpr:
 		analyzeExpr(ex.Operand, idx, report, opts)

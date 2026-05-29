@@ -27,6 +27,13 @@ func ConvertDialect(sql string, target Dialect) (string, error) {
 }
 
 func ConvertDialectWithOptions(sql string, opts ConvertOptions) (string, error) {
+	if opts.Target == "" {
+		doc, err := ParseDocumentString(sql)
+		if err != nil {
+			return "", err
+		}
+		return doc.SQL(), nil
+	}
 	stmts, err := ParseStatements(sql)
 	if err != nil {
 		return "", err
@@ -104,8 +111,14 @@ func (r *dialectRenderer) renderStatement(stmt Statement) (string, error) {
 	case *ast.TransactionStmt:
 		return r.renderTx(s), nil
 	case *ast.GenericDDLStmt:
+		if r.strict {
+			return "", fmt.Errorf("generic DDL cannot be converted in strict mode")
+		}
 		return r.renderGenericDDL(s), nil
 	case *ast.ObjectDDLStmt:
+		if r.strict {
+			return "", fmt.Errorf("object DDL fallback cannot be converted in strict mode")
+		}
 		return r.renderObjectDDL(s), nil
 	default:
 		if r.strict {
@@ -1292,6 +1305,12 @@ func (r *dialectRenderer) renderExpr(expr Expr) string {
 		return "(" + sub + ")"
 	case *ast.CastExpr:
 		return "CAST(" + r.renderExpr(e.Expr) + " AS " + r.renderDataType(e.Type) + ")"
+	case *ast.IntervalExpr:
+		out := "INTERVAL " + r.renderExpr(e.Expr)
+		if len(e.Unit) > 0 {
+			out += " " + string(e.Unit)
+		}
+		return out
 	case *ast.SelectStmt:
 		s, _ := r.renderSelect(e)
 		return "(" + s + ")"

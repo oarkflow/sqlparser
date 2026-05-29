@@ -15,6 +15,7 @@ import (
 // ParseError records a parse failure.
 type ParseError struct {
 	Msg  string
+	Code string
 	Pos  int32
 	Line uint32
 	Col  uint32
@@ -35,6 +36,21 @@ type Parser struct {
 	// arena is a monotonic allocator that owns all AST node memory.
 	// Reusing the arena across parse calls (after Reset) avoids GC spikes.
 	arena arena
+
+	opts       ParseOptions
+	tokenCount int
+	depth      int
+}
+
+// ParseOptions controls guarded parsing for untrusted or production inputs.
+// Zero limits mean unlimited. AllowGenericDDL defaults to true for existing
+// parser entrypoints and false only when explicitly using WithOptions APIs.
+type ParseOptions struct {
+	MaxBytes        int
+	MaxTokens       int
+	MaxDepth        int
+	MaxStatements   int
+	AllowGenericDDL bool
 }
 
 // parserPool amortises Parser allocation for the convenience API
@@ -67,25 +83,44 @@ var (
 // New creates a Parser for the given SQL bytes.
 func New(src []byte) *Parser {
 	p := &Parser{}
+	p.opts = defaultParseOptions()
 	p.lex.Init(src)
-	p.tok = p.lex.Next()
+	p.tok = p.nextToken()
 	return p
 }
 
 // NewString creates a Parser for a SQL string.
 func NewString(src string) *Parser {
 	p := &Parser{}
+	p.opts = defaultParseOptions()
 	p.lex.InitString(src)
-	p.tok = p.lex.Next()
+	p.tok = p.nextToken()
 	return p
 }
 
 // Reset reuses the parser with new input, reusing internal memory.
 func (p *Parser) Reset(src []byte) {
 	p.lex.Init(src)
-	p.tok = p.lex.Next()
+	p.tokenCount = 0
+	p.depth = 0
+	p.tok = p.nextToken()
 	p.hasPeek = false
 	p.arena.reset()
+}
+
+// ResetWithOptions reuses the parser with guarded parse options.
+func (p *Parser) ResetWithOptions(src []byte, opts ParseOptions) error {
+	if opts.MaxBytes > 0 && len(src) > opts.MaxBytes {
+		return &ParseError{Code: "MAX_BYTES", Msg: "input exceeds MaxBytes", Line: 1, Col: 1}
+	}
+	p.opts = opts
+	p.lex.Init(src)
+	p.tokenCount = 0
+	p.depth = 0
+	p.tok = p.nextToken()
+	p.hasPeek = false
+	p.arena.reset()
+	return nil
 }
 
 // ParseOne parses a single SQL statement.
@@ -110,11 +145,20 @@ func (p *Parser) ParseAll() ([]ast.Statement, error) {
 		if p.tok.Type == lexer.EOF {
 			break
 		}
+		if err := p.checkLimits(p.tok.Pos); err != nil {
+			return stmts, err
+		}
 		stmt, err := p.parseStatement()
 		if err != nil {
 			return stmts, err
 		}
+		if err := p.checkLimits(p.tok.Pos); err != nil {
+			return stmts, err
+		}
 		stmts = arenaAppend(&p.arena, stmts, stmt)
+		if p.opts.MaxStatements > 0 && len(stmts) > p.opts.MaxStatements {
+			return stmts, p.limitError("MAX_STATEMENTS", p.tok.Pos, "statement count exceeds MaxStatements")
+		}
 	}
 	return stmts, nil
 }
@@ -122,8 +166,11 @@ func (p *Parser) ParseAll() ([]ast.Statement, error) {
 // ParseStatement is the public entrypoint for parsing a single statement.
 func ParseStatement(src string) (ast.Statement, error) {
 	p := parserPool.Get().(*Parser)
+	p.opts = defaultParseOptions()
 	p.lex.InitString(src)
-	p.tok = p.lex.Next()
+	p.tokenCount = 0
+	p.depth = 0
+	p.tok = p.nextToken()
 	p.hasPeek = false
 	p.arena.reset()
 	stmt, err := p.ParseOne()
@@ -134,8 +181,29 @@ func ParseStatement(src string) (ast.Statement, error) {
 // ParseStatements parses multiple statements.
 func ParseStatements(src string) ([]ast.Statement, error) {
 	p := parserPool.Get().(*Parser)
+	p.opts = defaultParseOptions()
 	p.lex.InitString(src)
-	p.tok = p.lex.Next()
+	p.tokenCount = 0
+	p.depth = 0
+	p.tok = p.nextToken()
+	p.hasPeek = false
+	p.arena.reset()
+	stmts, err := p.ParseAll()
+	parserPool.Put(p)
+	return stmts, err
+}
+
+// ParseStatementsWithOptions parses multiple statements with production guardrails.
+func ParseStatementsWithOptions(src string, opts ParseOptions) ([]ast.Statement, error) {
+	if opts.MaxBytes > 0 && len(src) > opts.MaxBytes {
+		return nil, &ParseError{Code: "MAX_BYTES", Msg: "input exceeds MaxBytes", Line: 1, Col: 1}
+	}
+	p := parserPool.Get().(*Parser)
+	p.opts = opts
+	p.lex.InitString(src)
+	p.tokenCount = 0
+	p.depth = 0
+	p.tok = p.nextToken()
 	p.hasPeek = false
 	p.arena.reset()
 	stmts, err := p.ParseAll()
@@ -151,17 +219,23 @@ func (p *Parser) advance() lexer.Token {
 		p.tok = p.peek
 		p.hasPeek = false
 	} else {
-		p.tok = p.lex.Next()
+		p.tok = p.nextToken()
 	}
 	return prev
 }
 
 func (p *Parser) peekToken() lexer.Token {
 	if !p.hasPeek {
-		p.peek = p.lex.Next()
+		p.peek = p.nextToken()
 		p.hasPeek = true
 	}
 	return p.peek
+}
+
+func (p *Parser) nextToken() lexer.Token {
+	tok := p.lex.Next()
+	p.tokenCount++
+	return tok
 }
 
 func (p *Parser) skipSemis() {
@@ -213,10 +287,42 @@ func (p *Parser) errorf(format string, args ...any) *ParseError {
 	line, col := lexer.ComputeLineCol(p.lex.Source(), int(p.tok.Pos))
 	return &ParseError{
 		Msg:  fmt.Sprintf(format, args...),
+		Code: "SYNTAX",
 		Pos:  p.tok.Pos,
 		Line: line,
 		Col:  col,
 	}
+}
+
+func (p *Parser) limitError(code string, pos int32, msg string) *ParseError {
+	line, col := lexer.ComputeLineCol(p.lex.Source(), int(pos))
+	return &ParseError{Code: code, Msg: msg, Pos: pos, Line: line, Col: col}
+}
+
+func (p *Parser) checkLimits(pos int32) error {
+	if p.opts.MaxTokens > 0 && p.tokenCount > p.opts.MaxTokens {
+		return p.limitError("MAX_TOKENS", pos, "token count exceeds MaxTokens")
+	}
+	return nil
+}
+
+func (p *Parser) enterDepth(pos int32) error {
+	p.depth++
+	if p.opts.MaxDepth > 0 && p.depth > p.opts.MaxDepth {
+		p.depth--
+		return p.limitError("MAX_DEPTH", pos, "parse depth exceeds MaxDepth")
+	}
+	return nil
+}
+
+func (p *Parser) leaveDepth() {
+	if p.depth > 0 {
+		p.depth--
+	}
+}
+
+func defaultParseOptions() ParseOptions {
+	return ParseOptions{AllowGenericDDL: true}
 }
 
 func arenaNode[T any](a *arena, v T) *T {
@@ -832,6 +938,10 @@ func tokenPrec(t lexer.TokenType) (precedence, bool) {
 }
 
 func (p *Parser) parseExpr(minPrec precedence) (ast.Expr, error) {
+	if err := p.enterDepth(p.tok.Pos); err != nil {
+		return nil, err
+	}
+	defer p.leaveDepth()
 	left, err := p.parseUnary()
 	if err != nil {
 		return nil, err
@@ -1129,6 +1239,19 @@ func (p *Parser) parsePrimary() (ast.Expr, error) {
 		return p.parseCast()
 
 	case lexer.IDENT, lexer.BACKTICK, lexer.DQUOTE:
+		if p.tok.Type == lexer.IDENT && equalASCIIFold(p.tok.Raw, "interval") {
+			pos := p.tok.Pos
+			p.advance()
+			expr, err := p.parseUnary()
+			if err != nil {
+				return nil, err
+			}
+			var unit []byte
+			if p.is(lexer.IDENT) || p.is(lexer.STRING) {
+				unit = p.advance().Raw
+			}
+			return arenaNode(&p.arena, ast.IntervalExpr{Expr: expr, Unit: unit, TokPos: pos}), nil
+		}
 		// Could be a function call, qualified ident, or plain ident.
 		name, err := p.parseQualifiedIdent()
 		if err != nil {
@@ -2608,6 +2731,9 @@ func (p *Parser) parseDrop() (ast.Statement, error) {
 }
 
 func (p *Parser) parseGenericDDL(verb, obj []byte) (*ast.GenericDDLStmt, error) {
+	if !p.opts.AllowGenericDDL {
+		return nil, p.limitError("GENERIC_DDL_DISABLED", p.tok.Pos, "generic DDL is disabled")
+	}
 	pos := p.tok.Pos
 	stmt := arenaNode(&p.arena, ast.GenericDDLStmt{Verb: verb, Object: obj, TokPos: pos})
 	p.advance() // object token
@@ -2630,6 +2756,9 @@ func (p *Parser) parseGenericDDL(verb, obj []byte) (*ast.GenericDDLStmt, error) 
 }
 
 func (p *Parser) parseObjectDDL(verb, obj []byte, pos int32, orReplace, allowIfExists bool) (*ast.ObjectDDLStmt, error) {
+	if !p.opts.AllowGenericDDL {
+		return nil, p.limitError("GENERIC_DDL_DISABLED", p.tok.Pos, "object DDL fallback is disabled")
+	}
 	stmt := arenaNode(&p.arena, ast.ObjectDDLStmt{Verb: verb, Object: obj, OrReplace: orReplace, TokPos: pos})
 	p.advance() // object token
 	if allowIfExists && p.is(lexer.IF) {
