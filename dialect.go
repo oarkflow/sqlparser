@@ -105,6 +105,8 @@ func (r *dialectRenderer) renderStatement(stmt Statement) (string, error) {
 		return r.renderTx(s), nil
 	case *ast.GenericDDLStmt:
 		return r.renderGenericDDL(s), nil
+	case *ast.ObjectDDLStmt:
+		return r.renderObjectDDL(s), nil
 	default:
 		if r.strict {
 			return "", fmt.Errorf("unsupported statement type %T", s)
@@ -152,21 +154,18 @@ func (r *dialectRenderer) renderSelect(s *ast.SelectStmt) (string, error) {
 	b.WriteString("SELECT ")
 	if s.Distinct {
 		b.WriteString("DISTINCT ")
-	}
-	for i, c := range s.Columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		if c.Star {
-			b.WriteByte('*')
-		} else {
-			b.WriteString(r.renderExpr(c.Expr))
-		}
-		if c.Alias != nil {
-			b.WriteString(" AS ")
-			b.WriteString(r.renderIdent(c.Alias))
+		if len(s.DistinctOn) > 0 {
+			b.WriteString("ON (")
+			for i, e := range s.DistinctOn {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(r.renderExpr(e))
+			}
+			b.WriteString(") ")
 		}
 	}
+	r.renderSelectColumns(&b, s.Columns)
 	if len(s.From) > 0 {
 		b.WriteString(" FROM ")
 		for i, tr := range s.From {
@@ -193,6 +192,17 @@ func (r *dialectRenderer) renderSelect(s *ast.SelectStmt) (string, error) {
 		b.WriteString(" HAVING ")
 		b.WriteString(r.renderExpr(s.Having))
 	}
+	if len(s.Windows) > 0 {
+		b.WriteString(" WINDOW ")
+		for i, w := range s.Windows {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.renderIdent(w.Name))
+			b.WriteString(" AS ")
+			b.WriteString(r.renderWindowSpec(w.Spec))
+		}
+	}
 	if len(s.OrderBy) > 0 {
 		b.WriteString(" ORDER BY ")
 		for i, it := range s.OrderBy {
@@ -205,6 +215,13 @@ func (r *dialectRenderer) renderSelect(s *ast.SelectStmt) (string, error) {
 			} else {
 				b.WriteString(" ASC")
 			}
+			if it.NullsFirst != nil {
+				if *it.NullsFirst {
+					b.WriteString(" NULLS FIRST")
+				} else {
+					b.WriteString(" NULLS LAST")
+				}
+			}
 		}
 	}
 	if s.Limit != nil {
@@ -213,6 +230,24 @@ func (r *dialectRenderer) renderSelect(s *ast.SelectStmt) (string, error) {
 		if s.Limit.Offset != nil {
 			b.WriteString(" OFFSET ")
 			b.WriteString(r.renderExpr(s.Limit.Offset))
+		}
+	}
+	if s.Lock != nil {
+		b.WriteString(" FOR ")
+		b.WriteString(string(s.Lock.Strength))
+		if len(s.Lock.Tables) > 0 {
+			b.WriteString(" OF ")
+			for i, t := range s.Lock.Tables {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(r.renderIdent(t))
+			}
+		}
+		if s.Lock.NoWait {
+			b.WriteString(" NOWAIT")
+		} else if s.Lock.SkipLock {
+			b.WriteString(" SKIP LOCKED")
 		}
 	}
 	if s.SetOp != nil {
@@ -280,6 +315,18 @@ func (r *dialectRenderer) renderInsert(s *ast.InsertStmt) (string, error) {
 			}
 			b.WriteByte(')')
 		}
+	} else if len(s.Set) > 0 {
+		b.WriteString(" SET ")
+		for i, a := range s.Set {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.renderIdent(a.Column))
+			b.WriteString(" = ")
+			b.WriteString(r.renderExpr(a.Value))
+		}
+	} else if s.DefaultValues {
+		b.WriteString(" DEFAULT VALUES")
 	} else if s.Select != nil {
 		sel, err := r.renderSelect(s.Select)
 		if err != nil {
@@ -331,6 +378,10 @@ func (r *dialectRenderer) renderInsert(s *ast.InsertStmt) (string, error) {
 				}
 				b.WriteByte(')')
 			}
+			if s.OnConflictWhere != nil {
+				b.WriteString(" WHERE ")
+				b.WriteString(r.renderExpr(s.OnConflictWhere))
+			}
 			if doNothing && len(assign) == 0 {
 				b.WriteString(" DO NOTHING")
 			} else {
@@ -345,6 +396,10 @@ func (r *dialectRenderer) renderInsert(s *ast.InsertStmt) (string, error) {
 				}
 			}
 		}
+	}
+	if len(s.Returning) > 0 {
+		b.WriteString(" RETURNING ")
+		r.renderSelectColumns(&b, s.Returning)
 	}
 	return b.String(), nil
 }
@@ -388,18 +443,42 @@ func (r *dialectRenderer) renderUpdate(s *ast.UpdateStmt) (string, error) {
 		b.WriteString(" LIMIT ")
 		b.WriteString(r.renderExpr(s.Limit.Count))
 	}
+	if len(s.Returning) > 0 {
+		b.WriteString(" RETURNING ")
+		r.renderSelectColumns(&b, s.Returning)
+	}
 	return b.String(), nil
 }
 
 func (r *dialectRenderer) renderDelete(s *ast.DeleteStmt) (string, error) {
 	var b strings.Builder
 	b.WriteString(r.renderWith(s.With))
-	b.WriteString("DELETE FROM ")
+	b.WriteString("DELETE ")
+	if len(s.Tables) > 0 {
+		for i, t := range s.Tables {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.renderQualifiedIdent(t))
+		}
+		b.WriteString(" FROM ")
+	} else {
+		b.WriteString("FROM ")
+	}
 	for i, tr := range s.From {
 		if i > 0 {
 			b.WriteString(", ")
 		}
 		b.WriteString(r.renderTableRef(tr))
+	}
+	if len(s.Using) > 0 {
+		b.WriteString(" USING ")
+		for i, tr := range s.Using {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.renderTableRef(tr))
+		}
 	}
 	if s.Where != nil {
 		b.WriteString(" WHERE ")
@@ -421,12 +500,26 @@ func (r *dialectRenderer) renderDelete(s *ast.DeleteStmt) (string, error) {
 		b.WriteString(" LIMIT ")
 		b.WriteString(r.renderExpr(s.Limit.Count))
 	}
+	if len(s.Returning) > 0 {
+		b.WriteString(" RETURNING ")
+		r.renderSelectColumns(&b, s.Returning)
+	}
 	return b.String(), nil
 }
 
 func (r *dialectRenderer) renderCreateTable(s *ast.CreateTableStmt) (string, error) {
 	var b strings.Builder
-	b.WriteString("CREATE TABLE ")
+	b.WriteString("CREATE ")
+	if s.OrReplace {
+		b.WriteString("OR REPLACE ")
+	}
+	if s.Temporary {
+		b.WriteString("TEMPORARY ")
+	}
+	if s.Unlogged {
+		b.WriteString("UNLOGGED ")
+	}
+	b.WriteString("TABLE ")
 	if s.IfNotExists {
 		b.WriteString("IF NOT EXISTS ")
 	}
@@ -557,6 +650,9 @@ func (r *dialectRenderer) renderCreateView(s *ast.CreateViewStmt) (string, error
 	if s.OrReplace {
 		b.WriteString("OR REPLACE ")
 	}
+	if s.Materialized {
+		b.WriteString("MATERIALIZED ")
+	}
 	b.WriteString("VIEW ")
 	b.WriteString(r.renderQualifiedIdent(s.Name))
 	if len(s.Columns) > 0 {
@@ -682,6 +778,30 @@ func (r *dialectRenderer) renderGenericDDL(s *ast.GenericDDLStmt) string {
 	if s.Name != nil {
 		out += " " + r.renderIdent(s.Name)
 	}
+	if len(s.Body) > 0 {
+		out += " " + strings.TrimSpace(string(s.Body))
+	}
+	return out
+}
+
+func (r *dialectRenderer) renderObjectDDL(s *ast.ObjectDDLStmt) string {
+	out := strings.ToUpper(string(s.Verb)) + " "
+	if s.OrReplace {
+		out += "OR REPLACE "
+	}
+	out += strings.ToUpper(string(s.Object))
+	if s.IfExists {
+		out += " IF EXISTS"
+	}
+	if s.IfNotExists {
+		out += " IF NOT EXISTS"
+	}
+	if s.Name != nil {
+		out += " " + r.renderIdent(s.Name)
+	}
+	if len(s.Body) > 0 {
+		out += " " + strings.TrimSpace(string(s.Body))
+	}
 	return out
 }
 
@@ -705,6 +825,17 @@ func (r *dialectRenderer) renderColumnDef(c *ast.ColumnDef) string {
 			b.WriteString(" GENERATED BY DEFAULT AS IDENTITY")
 		} else {
 			b.WriteString(" AUTO_INCREMENT")
+		}
+	}
+	if c.Identity && !c.AutoIncrement {
+		b.WriteString(" GENERATED BY DEFAULT AS IDENTITY")
+	}
+	if c.Generated != nil {
+		b.WriteString(" GENERATED ALWAYS AS (")
+		b.WriteString(r.renderExpr(c.Generated.Expr))
+		b.WriteByte(')')
+		if c.Generated.Stored {
+			b.WriteString(" STORED")
 		}
 	}
 	if c.PrimaryKey {
@@ -827,6 +958,32 @@ func (r *dialectRenderer) renderAlterCmd(cmd ast.AlterCmd) string {
 		return "ADD " + r.renderConstraint(c.Constraint)
 	case *ast.DropIndexCmd:
 		return "DROP INDEX " + r.renderIdent(c.Name)
+	case *ast.DropConstraintCmd:
+		out := "DROP CONSTRAINT "
+		if c.IfExists {
+			out += "IF EXISTS "
+		}
+		return out + r.renderIdent(c.Name)
+	case *ast.AlterColumnCmd:
+		switch string(c.Action) {
+		case "set_not_null":
+			return "ALTER COLUMN " + r.renderIdent(c.Name) + " SET NOT NULL"
+		case "drop_default":
+			return "ALTER COLUMN " + r.renderIdent(c.Name) + " DROP DEFAULT"
+		case "drop_not_null":
+			return "ALTER COLUMN " + r.renderIdent(c.Name) + " DROP NOT NULL"
+		case "set":
+			if c.Expr != nil {
+				return "ALTER COLUMN " + r.renderIdent(c.Name) + " SET DEFAULT " + r.renderExpr(c.Expr)
+			}
+		case "type":
+			return "ALTER COLUMN " + r.renderIdent(c.Name) + " TYPE"
+		default:
+			if len(c.Action) > 0 {
+				return "RENAME COLUMN " + r.renderIdent(c.Name) + " TO " + string(c.Action)
+			}
+		}
+		return "ALTER COLUMN " + r.renderIdent(c.Name)
 	case *ast.RenameTableCmd:
 		return "RENAME TO " + r.renderQualifiedIdent(c.NewName)
 	default:
@@ -834,21 +991,70 @@ func (r *dialectRenderer) renderAlterCmd(cmd ast.AlterCmd) string {
 	}
 }
 
+func (r *dialectRenderer) renderAliasColumns(cols []*ast.Ident) string {
+	if len(cols) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(" (")
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(r.renderIdent(c))
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
 func (r *dialectRenderer) renderTableRef(tr ast.TableRef) string {
 	switch t := tr.(type) {
 	case *ast.SimpleTable:
 		out := r.renderQualifiedIdent(t.Name)
+		if t.Lateral {
+			out = "LATERAL " + out
+		}
 		if t.Alias != nil {
 			out += " " + r.renderIdent(t.Alias)
+			out += r.renderAliasColumns(t.Columns)
 		}
 		return out
 	case *ast.SubqueryTable:
 		sub, _ := r.renderSelect(t.Subq)
 		out := "(" + sub + ")"
+		if t.Lateral {
+			out = "LATERAL " + out
+		}
 		if t.Alias != nil {
 			out += " " + r.renderIdent(t.Alias)
+			out += r.renderAliasColumns(t.Columns)
 		}
 		return out
+	case *ast.ValuesTable:
+		var b strings.Builder
+		if t.Lateral {
+			b.WriteString("LATERAL ")
+		}
+		b.WriteString("VALUES ")
+		for i, row := range t.Rows {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteByte('(')
+			for j, e := range row {
+				if j > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(r.renderExpr(e))
+			}
+			b.WriteByte(')')
+		}
+		if t.Alias != nil {
+			b.WriteByte(' ')
+			b.WriteString(r.renderIdent(t.Alias))
+			b.WriteString(r.renderAliasColumns(t.Columns))
+		}
+		return b.String()
 	case *ast.JoinTable:
 		out := r.renderTableRef(t.Left) + " "
 		switch t.Kind {
@@ -883,6 +1089,88 @@ func (r *dialectRenderer) renderTableRef(tr ast.TableRef) string {
 	default:
 		return ""
 	}
+}
+
+func (r *dialectRenderer) renderSelectColumns(b *strings.Builder, cols []ast.SelectColumn) {
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if c.Star {
+			if c.Qualifier != nil && len(c.Qualifier.Parts) > 1 {
+				for j, p := range c.Qualifier.Parts[:len(c.Qualifier.Parts)-1] {
+					if j > 0 {
+						b.WriteByte('.')
+					}
+					b.WriteString(r.renderIdent(p))
+				}
+				b.WriteString(".*")
+			} else {
+				b.WriteByte('*')
+			}
+		} else {
+			b.WriteString(r.renderExpr(c.Expr))
+		}
+		if c.Alias != nil {
+			b.WriteString(" AS ")
+			b.WriteString(r.renderIdent(c.Alias))
+		}
+	}
+}
+
+func (r *dialectRenderer) renderWindowSpec(w *ast.WindowSpec) string {
+	if w == nil {
+		return "()"
+	}
+	if w.Name != nil && len(w.PartitionBy) == 0 && len(w.OrderBy) == 0 && len(w.Raw) == 0 {
+		return r.renderIdent(w.Name)
+	}
+	var b strings.Builder
+	b.WriteByte('(')
+	wrote := false
+	if w.Name != nil {
+		b.WriteString(r.renderIdent(w.Name))
+		wrote = true
+	}
+	if len(w.PartitionBy) > 0 {
+		if wrote {
+			b.WriteByte(' ')
+		}
+		b.WriteString("PARTITION BY ")
+		for i, e := range w.PartitionBy {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.renderExpr(e))
+		}
+		wrote = true
+	}
+	if len(w.OrderBy) > 0 {
+		if wrote {
+			b.WriteByte(' ')
+		}
+		b.WriteString("ORDER BY ")
+		for i, it := range w.OrderBy {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.renderExpr(it.Expr))
+			if it.Desc {
+				b.WriteString(" DESC")
+			} else {
+				b.WriteString(" ASC")
+			}
+		}
+		wrote = true
+	}
+	if len(w.Raw) > 0 {
+		if wrote {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strings.TrimSpace(string(w.Raw)))
+	}
+	b.WriteByte(')')
+	return b.String()
 }
 
 func (r *dialectRenderer) renderExpr(expr Expr) string {
@@ -921,6 +1209,15 @@ func (r *dialectRenderer) renderExpr(expr Expr) string {
 			}
 		}
 		b.WriteByte(')')
+		if e.Filter != nil {
+			b.WriteString(" FILTER (WHERE ")
+			b.WriteString(r.renderExpr(e.Filter))
+			b.WriteByte(')')
+		}
+		if e.Over != nil {
+			b.WriteString(" OVER ")
+			b.WriteString(r.renderWindowSpec(e.Over))
+		}
 		return b.String()
 	case *ast.CaseExpr:
 		var b strings.Builder

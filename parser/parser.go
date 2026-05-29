@@ -4,9 +4,7 @@
 package parser
 
 import (
-	"bytes"
 	"fmt"
-	"strconv"
 	"sync"
 	"unsafe"
 
@@ -44,6 +42,27 @@ type Parser struct {
 var parserPool = sync.Pool{
 	New: func() any { return &Parser{} },
 }
+
+var (
+	kwCreate           = []byte("create")
+	kwDrop             = []byte("drop")
+	kwAlter            = []byte("alter")
+	kwMaterializedView = []byte("materialized view")
+	actionSet          = []byte("set")
+	actionSetNotNull   = []byte("set_not_null")
+	actionDrop         = []byte("drop")
+	actionDropDefault  = []byte("drop_default")
+	actionDropNotNull  = []byte("drop_not_null")
+	actionType         = []byte("type")
+	actionBegin        = []byte("begin")
+	actionCommit       = []byte("commit")
+	actionRollback     = []byte("rollback")
+	actionStartTx      = []byte("start_transaction")
+	actionSavepoint    = []byte("savepoint")
+	actionReleaseSP    = []byte("release_savepoint")
+	actionSetTx        = []byte("set_transaction")
+	lockKeyShare       = []byte("KEY SHARE")
+)
 
 // New creates a Parser for the given SQL bytes.
 func New(src []byte) *Parser {
@@ -95,7 +114,7 @@ func (p *Parser) ParseAll() ([]ast.Statement, error) {
 		if err != nil {
 			return stmts, err
 		}
-		stmts = append(stmts, stmt)
+		stmts = arenaAppend(&p.arena, stmts, stmt)
 	}
 	return stmts, nil
 }
@@ -362,7 +381,22 @@ func (p *Parser) parseSelectCore(pos int32) (*ast.SelectStmt, error) {
 		return nil, err
 	}
 	stmt := arenaNode(&p.arena, ast.SelectStmt{TokPos: pos})
-	stmt.Distinct = p.tryEatKeyword(lexer.DISTINCT)
+	if p.tryEatKeyword(lexer.DISTINCT) {
+		stmt.Distinct = true
+		if p.tryEatKeyword(lexer.ON) {
+			if _, err := p.eat(lexer.LPAREN); err != nil {
+				return nil, err
+			}
+			on, err := p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+			stmt.DistinctOn = on
+			if _, err := p.eat(lexer.RPAREN); err != nil {
+				return nil, err
+			}
+		}
+	}
 	_ = p.tryEatKeyword(lexer.ALL)
 
 	// Column list
@@ -410,6 +444,15 @@ func (p *Parser) parseSelectCore(pos int32) (*ast.SelectStmt, error) {
 		stmt.Having = hav
 	}
 
+	// WINDOW
+	if p.tryEatKeyword(lexer.WINDOW) {
+		wins, err := p.parseWindowDefs()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Windows = wins
+	}
+
 	// ORDER BY
 	if p.is(lexer.ORDER) && p.peekToken().Type == lexer.BY {
 		p.advance()
@@ -428,6 +471,13 @@ func (p *Parser) parseSelectCore(pos int32) (*ast.SelectStmt, error) {
 			return nil, err
 		}
 		stmt.Limit = lim
+	}
+	if p.tryEatKeyword(lexer.FOR) {
+		lock, err := p.parseLockClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Lock = lock
 	}
 
 	return stmt, nil
@@ -502,6 +552,10 @@ func (p *Parser) parseSelectColumn() (ast.SelectColumn, error) {
 		return ast.SelectColumn{}, err
 	}
 	col := ast.SelectColumn{Expr: expr}
+	if qi, ok := expr.(*ast.QualifiedIdent); ok && len(qi.Parts) > 0 && qi.Parts[len(qi.Parts)-1].Unquoted == "*" {
+		col.Star = true
+		col.Qualifier = qi
+	}
 	if p.tryEatKeyword(lexer.AS) || p.is(lexer.IDENT) || p.is(lexer.BACKTICK) || p.is(lexer.DQUOTE) {
 		alias, err := p.parseIdent()
 		if err != nil {
@@ -534,6 +588,7 @@ func (p *Parser) parseTableRefs() ([]ast.TableRef, error) {
 func (p *Parser) parseTableRef() (ast.TableRef, error) {
 	var left ast.TableRef
 	var err error
+	lateral := p.tryEatKeyword(lexer.LATERAL)
 	if p.is(lexer.LPAREN) {
 		p.advance()
 		if p.is(lexer.SELECT) || p.is(lexer.WITH) {
@@ -544,9 +599,19 @@ func (p *Parser) parseTableRef() (ast.TableRef, error) {
 			if _, err := p.eat(lexer.RPAREN); err != nil {
 				return nil, err
 			}
-			sub := arenaNode(&p.arena, ast.SubqueryTable{Subq: sq, TokPos: sq.TokPos})
-			sub.Alias, _ = p.parseOptionalAlias()
+			sub := arenaNode(&p.arena, ast.SubqueryTable{Subq: sq, Lateral: lateral, TokPos: sq.TokPos})
+			sub.Alias, sub.Columns, _ = p.parseOptionalAlias()
 			left = sub
+		} else if p.is(lexer.VALUES) {
+			vals, err := p.parseValuesTable(lateral)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.eat(lexer.RPAREN); err != nil {
+				return nil, err
+			}
+			vals.Alias, vals.Columns, _ = p.parseOptionalAlias()
+			left = vals
 		} else {
 			// Parenthesized join
 			inner, err := p.parseTableRef()
@@ -559,13 +624,20 @@ func (p *Parser) parseTableRef() (ast.TableRef, error) {
 			left = inner
 		}
 	} else {
-		name, err := p.parseQualifiedIdent()
-		if err != nil {
-			return nil, err
+		if p.is(lexer.VALUES) {
+			left, err = p.parseValuesTable(lateral)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			name, err := p.parseQualifiedIdent()
+			if err != nil {
+				return nil, err
+			}
+			st := arenaNode(&p.arena, ast.SimpleTable{Name: name, Lateral: lateral})
+			st.Alias, st.Columns, _ = p.parseOptionalAlias()
+			left = st
 		}
-		st := arenaNode(&p.arena, ast.SimpleTable{Name: name})
-		st.Alias, _ = p.parseOptionalAlias()
-		left = st
 	}
 
 	// JOIN chains
@@ -663,12 +735,51 @@ func (p *Parser) parseJoin(left ast.TableRef) (ast.TableRef, error) {
 	return jt, nil
 }
 
-func (p *Parser) parseOptionalAlias() (*ast.Ident, error) {
+func (p *Parser) parseOptionalAlias() (*ast.Ident, []*ast.Ident, error) {
 	p.tryEatKeyword(lexer.AS)
 	if p.is(lexer.IDENT) || p.is(lexer.BACKTICK) || p.is(lexer.DQUOTE) {
-		return p.parseIdent()
+		alias, err := p.parseIdent()
+		if err != nil {
+			return nil, nil, err
+		}
+		var cols []*ast.Ident
+		if p.tryEat(lexer.LPAREN) {
+			cols, err = p.parseIdentList()
+			if err != nil {
+				return nil, nil, err
+			}
+			if _, err := p.eat(lexer.RPAREN); err != nil {
+				return nil, nil, err
+			}
+		}
+		return alias, cols, nil
 	}
-	return nil, nil
+	return nil, nil, nil
+}
+
+func (p *Parser) parseValuesTable(lateral bool) (*ast.ValuesTable, error) {
+	pos := p.tok.Pos
+	if err := p.eatKeyword(lexer.VALUES); err != nil {
+		return nil, err
+	}
+	vt := arenaNode(&p.arena, ast.ValuesTable{Lateral: lateral, TokPos: pos})
+	for {
+		if _, err := p.eat(lexer.LPAREN); err != nil {
+			return nil, err
+		}
+		row, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		vt.Rows = arenaAppend(&p.arena, vt.Rows, row)
+		if _, err := p.eat(lexer.RPAREN); err != nil {
+			return nil, err
+		}
+		if !p.tryEat(lexer.COMMA) {
+			break
+		}
+	}
+	return vt, nil
 }
 
 // ---- Expression parsing (Pratt / top-down operator precedence) ----
@@ -729,6 +840,49 @@ func (p *Parser) parseExpr(minPrec precedence) (ast.Expr, error) {
 	for {
 		// Infix / postfix operators
 		switch p.tok.Type {
+		case lexer.FILTER:
+			fc, ok := left.(*ast.FuncCall)
+			if !ok {
+				return nil, p.errorf("FILTER can only follow a function call")
+			}
+			p.advance()
+			if _, err := p.eat(lexer.LPAREN); err != nil {
+				return nil, err
+			}
+			if err := p.eatKeyword(lexer.WHERE); err != nil {
+				return nil, err
+			}
+			filter, err := p.parseExpr(0)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.eat(lexer.RPAREN); err != nil {
+				return nil, err
+			}
+			fc.Filter = filter
+			continue
+
+		case lexer.OVER:
+			fc, ok := left.(*ast.FuncCall)
+			if !ok {
+				return nil, p.errorf("OVER can only follow a function call")
+			}
+			p.advance()
+			if p.is(lexer.LPAREN) {
+				spec, err := p.parseWindowSpec()
+				if err != nil {
+					return nil, err
+				}
+				fc.Over = spec
+			} else {
+				name, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				fc.Over = arenaNode(&p.arena, ast.WindowSpec{Name: name, TokPos: name.TokPos})
+			}
+			continue
+
 		case lexer.IS:
 			pos := p.tok.Pos
 			p.advance()
@@ -1119,6 +1273,17 @@ func (p *Parser) parseOrderBy() ([]ast.OrderByItem, error) {
 		} else {
 			p.tryEatKeyword(lexer.ASC)
 		}
+		if p.tryEatKeyword(lexer.NULLS) {
+			first := true
+			if p.tryEatKeyword(lexer.FIRST) {
+				first = true
+			} else if p.tryEatKeyword(lexer.LAST) {
+				first = false
+			} else {
+				return nil, p.errorf("expected FIRST or LAST after NULLS")
+			}
+			item.NullsFirst = arenaNode(&p.arena, first)
+		}
 		items = arenaAppend(&p.arena, items, item)
 		if !p.tryEat(lexer.COMMA) {
 			break
@@ -1149,6 +1314,123 @@ func (p *Parser) parseLimit() (*ast.LimitClause, error) {
 		lim.Count = off
 	}
 	return lim, nil
+}
+
+func (p *Parser) parseWindowDefs() ([]ast.WindowDef, error) {
+	var defs []ast.WindowDef
+	for {
+		name, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.eatKeyword(lexer.AS); err != nil {
+			return nil, err
+		}
+		spec, err := p.parseWindowSpec()
+		if err != nil {
+			return nil, err
+		}
+		defs = arenaAppend(&p.arena, defs, ast.WindowDef{Name: name, Spec: spec})
+		if !p.tryEat(lexer.COMMA) {
+			break
+		}
+	}
+	return defs, nil
+}
+
+func (p *Parser) parseWindowSpec() (*ast.WindowSpec, error) {
+	pos := p.tok.Pos
+	if _, err := p.eat(lexer.LPAREN); err != nil {
+		return nil, err
+	}
+	spec := arenaNode(&p.arena, ast.WindowSpec{TokPos: pos})
+	if p.is(lexer.IDENT) && p.peekToken().Type != lexer.RPAREN && p.peekToken().Type != lexer.PARTITION && p.peekToken().Type != lexer.ORDER {
+		spec.Name, _ = p.parseIdent()
+	}
+	if p.is(lexer.PARTITION) {
+		p.advance()
+		if err := p.eatKeyword(lexer.BY); err != nil {
+			return nil, err
+		}
+		exprs, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		spec.PartitionBy = exprs
+	}
+	if p.is(lexer.ORDER) && p.peekToken().Type == lexer.BY {
+		p.advance()
+		p.advance()
+		ord, err := p.parseOrderBy()
+		if err != nil {
+			return nil, err
+		}
+		spec.OrderBy = ord
+	}
+	// Preserve unsupported frame details without modeling every dialect variant.
+	if !p.is(lexer.RPAREN) {
+		start := p.tok.Pos
+		depth := 0
+		for !(p.is(lexer.RPAREN) && depth == 0) && !p.is(lexer.EOF) {
+			if p.is(lexer.LPAREN) {
+				depth++
+			} else if p.is(lexer.RPAREN) {
+				depth--
+			}
+			p.advance()
+		}
+		end := int(p.tok.Pos)
+		src := p.lex.Source()
+		if int(start) < end && end <= len(src) {
+			spec.Raw = src[start:end]
+		}
+	}
+	if _, err := p.eat(lexer.RPAREN); err != nil {
+		return nil, err
+	}
+	return spec, nil
+}
+
+func (p *Parser) parseLockClause() (*ast.LockClause, error) {
+	pos := p.tok.Pos
+	lock := arenaNode(&p.arena, ast.LockClause{Strength: p.tok.Raw, TokPos: pos})
+	switch p.tok.Type {
+	case lexer.UPDATE:
+		p.advance()
+	case lexer.IDENT:
+		p.advance()
+	case lexer.KEY:
+		p.advance()
+		if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "share") {
+			lock.Strength = lockKeyShare
+			p.advance()
+		}
+	default:
+		return nil, p.errorf("expected lock strength after FOR, got %q", p.tok.Raw)
+	}
+	if p.tryEatKeyword(lexer.OF) {
+		for {
+			id, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			lock.Tables = arenaAppend(&p.arena, lock.Tables, id)
+			if !p.tryEat(lexer.COMMA) {
+				break
+			}
+		}
+	}
+	if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "nowait") {
+		lock.NoWait = true
+		p.advance()
+	} else if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "skip") {
+		p.advance()
+		if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "locked") {
+			lock.SkipLock = true
+			p.advance()
+		}
+	}
+	return lock, nil
 }
 
 // ---- INSERT ----
@@ -1183,6 +1465,17 @@ func (p *Parser) parseInsert() (*ast.InsertStmt, error) {
 			return nil, err
 		}
 		stmt.Select = sq
+	} else if p.tryEatKeyword(lexer.DEFAULT) {
+		if err := p.eatKeyword(lexer.VALUES); err != nil {
+			return nil, err
+		}
+		stmt.DefaultValues = true
+	} else if p.tryEatKeyword(lexer.SET) {
+		asgn, err := p.parseAssignments()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Set = asgn
 	} else if p.tryEatKeyword(lexer.VALUES) {
 		for {
 			if _, err := p.eat(lexer.LPAREN); err != nil {
@@ -1205,7 +1498,7 @@ func (p *Parser) parseInsert() (*ast.InsertStmt, error) {
 	// ON DUPLICATE KEY UPDATE
 	if p.is(lexer.ON) {
 		next := p.peekToken()
-		if next.Type == lexer.IDENT && bytes.EqualFold(next.Raw, []byte("duplicate")) {
+		if next.Type == lexer.IDENT && equalASCIIFold(next.Raw, "duplicate") {
 			p.advance() // ON
 			p.advance() // DUPLICATE (as IDENT)
 			p.advance() // KEY (as IDENT or keyword)
@@ -1217,7 +1510,7 @@ func (p *Parser) parseInsert() (*ast.InsertStmt, error) {
 				return nil, err
 			}
 			stmt.OnDupKey = asgn
-		} else if next.Type == lexer.IDENT && bytes.EqualFold(next.Raw, []byte("conflict")) {
+		} else if next.Type == lexer.IDENT && equalASCIIFold(next.Raw, "conflict") {
 			p.advance() // ON
 			p.advance() // CONFLICT
 			if p.is(lexer.LPAREN) {
@@ -1231,11 +1524,18 @@ func (p *Parser) parseInsert() (*ast.InsertStmt, error) {
 					return nil, err
 				}
 			}
-			if !(p.is(lexer.IDENT) && bytes.EqualFold(p.tok.Raw, []byte("do"))) {
+			if p.tryEatKeyword(lexer.WHERE) {
+				w, err := p.parseExpr(0)
+				if err != nil {
+					return nil, err
+				}
+				stmt.OnConflictWhere = w
+			}
+			if !(p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "do")) {
 				return nil, p.errorf("expected DO in ON CONFLICT clause, got %q", p.tok.Raw)
 			}
 			p.advance() // DO
-			if p.is(lexer.IDENT) && bytes.EqualFold(p.tok.Raw, []byte("nothing")) {
+			if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "nothing") {
 				p.advance() // NOTHING
 				stmt.OnConflictDoNothing = true
 			} else if p.tryEatKeyword(lexer.UPDATE) {
@@ -1247,10 +1547,24 @@ func (p *Parser) parseInsert() (*ast.InsertStmt, error) {
 					return nil, err
 				}
 				stmt.OnConflictUpdate = asgn
+				if p.tryEatKeyword(lexer.WHERE) {
+					w, err := p.parseExpr(0)
+					if err != nil {
+						return nil, err
+					}
+					stmt.OnConflictWhere = w
+				}
 			} else {
 				return nil, p.errorf("expected NOTHING or UPDATE in ON CONFLICT DO clause, got %q", p.tok.Raw)
 			}
 		}
+	}
+	if p.tryEatKeyword(lexer.RETURNING) {
+		ret, err := p.parseSelectColumns()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = ret
 	}
 
 	return stmt, nil
@@ -1296,6 +1610,19 @@ func (p *Parser) parseReplace() (*ast.InsertStmt, error) {
 				break
 			}
 		}
+	} else if p.is(lexer.SELECT) || p.is(lexer.WITH) {
+		sq, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Select = sq
+	}
+	if p.tryEatKeyword(lexer.RETURNING) {
+		ret, err := p.parseSelectColumns()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = ret
 	}
 	return stmt, nil
 }
@@ -1342,6 +1669,13 @@ func (p *Parser) parseUpdate() (*ast.UpdateStmt, error) {
 		}
 		stmt.Limit = lim
 	}
+	if p.tryEatKeyword(lexer.RETURNING) {
+		ret, err := p.parseSelectColumns()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = ret
+	}
 	return stmt, nil
 }
 
@@ -1351,12 +1685,33 @@ func (p *Parser) parseDelete() (*ast.DeleteStmt, error) {
 	pos := p.tok.Pos
 	p.advance()
 	stmt := arenaNode(&p.arena, ast.DeleteStmt{TokPos: pos})
-	p.tryEatKeyword(lexer.FROM)
+	if !p.tryEatKeyword(lexer.FROM) {
+		for {
+			name, err := p.parseQualifiedIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Tables = arenaAppend(&p.arena, stmt.Tables, name)
+			if !p.tryEat(lexer.COMMA) {
+				break
+			}
+		}
+		if err := p.eatKeyword(lexer.FROM); err != nil {
+			return nil, err
+		}
+	}
 	refs, err := p.parseTableRefs()
 	if err != nil {
 		return nil, err
 	}
 	stmt.From = refs
+	if p.tryEatKeyword(lexer.USING) {
+		using, err := p.parseTableRefs()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Using = using
+	}
 	if p.tryEatKeyword(lexer.WHERE) {
 		w, err := p.parseExpr(0)
 		if err != nil {
@@ -1380,15 +1735,23 @@ func (p *Parser) parseDelete() (*ast.DeleteStmt, error) {
 		}
 		stmt.Limit = lim
 	}
+	if p.tryEatKeyword(lexer.RETURNING) {
+		ret, err := p.parseSelectColumns()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = ret
+	}
 	return stmt, nil
 }
 
 // ---- CREATE ----
 
 func (p *Parser) parseCreate() (ast.Statement, error) {
+	createPos := p.tok.Pos
 	p.advance() // CREATE
 	orReplace := false
-	if p.is(lexer.IDENT) && bytes.EqualFold(p.tok.Raw, []byte("or")) {
+	if p.is(lexer.OR) || (p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "or")) {
 		p.advance() // OR
 		if err := p.eatKeyword(lexer.REPLACE); err != nil {
 			return nil, err
@@ -1400,25 +1763,36 @@ func (p *Parser) parseCreate() (ast.Statement, error) {
 		p.advance()
 		temporary = true
 	}
-	_ = temporary
+	unlogged := false
+	if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "unlogged") {
+		p.advance()
+		unlogged = true
+	}
+	materialized := false
+	if p.tryEatKeyword(lexer.MATERIALIZED) {
+		materialized = true
+	}
 	switch p.tok.Type {
 	case lexer.DATABASE:
 		return p.parseCreateDatabase()
 	case lexer.TABLE:
-		return p.parseCreateTable(orReplace)
+		return p.parseCreateTable(orReplace, temporary, unlogged)
 	case lexer.VIEW:
-		return p.parseCreateView(orReplace)
+		return p.parseCreateView(orReplace, materialized)
 	case lexer.INDEX, lexer.UNIQUE:
 		return p.parseCreateIndex()
 	case lexer.FUNCTION, lexer.PROCEDURE, lexer.TRIGGER:
-		return p.parseGenericDDL([]byte("create"), p.tok.Raw)
+		return p.parseObjectDDL(kwCreate, p.tok.Raw, createPos, orReplace, false)
 	case lexer.IDENT:
 		if equalASCIIFold(p.tok.Raw, "schema") {
 			return p.parseCreateDatabase()
 		}
-		return p.parseGenericDDL([]byte("create"), p.tok.Raw)
+		if equalASCIIFold(p.tok.Raw, "sequence") {
+			return p.parseObjectDDL(kwCreate, p.tok.Raw, createPos, orReplace, false)
+		}
+		return p.parseGenericDDL(kwCreate, p.tok.Raw)
 	default:
-		return p.parseGenericDDL([]byte("create"), p.tok.Raw)
+		return p.parseGenericDDL(kwCreate, p.tok.Raw)
 	}
 }
 
@@ -1454,10 +1828,10 @@ func (p *Parser) parseCreateDatabase() (*ast.CreateDatabaseStmt, error) {
 	return stmt, nil
 }
 
-func (p *Parser) parseCreateTable(orReplace bool) (*ast.CreateTableStmt, error) {
+func (p *Parser) parseCreateTable(orReplace, temporary, unlogged bool) (*ast.CreateTableStmt, error) {
 	pos := p.tok.Pos
 	p.advance() // TABLE
-	stmt := arenaNode(&p.arena, ast.CreateTableStmt{TokPos: pos})
+	stmt := arenaNode(&p.arena, ast.CreateTableStmt{TokPos: pos, OrReplace: orReplace, Temporary: temporary, Unlogged: unlogged})
 	if p.is(lexer.IF) {
 		p.advance()
 		p.advance() // NOT
@@ -1617,7 +1991,51 @@ func (p *Parser) parseColumnDef() (*ast.ColumnDef, error) {
 			if _, err := p.eat(lexer.RPAREN); err != nil {
 				return nil, err
 			}
+		case lexer.ON:
+			p.advance()
+			if err := p.eatKeyword(lexer.UPDATE); err != nil {
+				return nil, err
+			}
+			expr, err := p.parseExpr(0)
+			if err != nil {
+				return nil, err
+			}
+			col.OnUpdate = expr
 		default:
+			if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "generated") {
+				p.advance()
+				if (p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "always")) || p.is(lexer.BY) {
+					p.advance()
+					if p.is(lexer.DEFAULT) || (p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "default")) {
+						p.advance()
+					}
+				}
+				if err := p.eatKeyword(lexer.AS); err != nil {
+					return nil, err
+				}
+				if p.tryEat(lexer.LPAREN) {
+					expr, err := p.parseExpr(0)
+					if err != nil {
+						return nil, err
+					}
+					col.Generated = arenaNode(&p.arena, ast.GeneratedCol{Expr: expr})
+					if _, err := p.eat(lexer.RPAREN); err != nil {
+						return nil, err
+					}
+					if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "stored") {
+						col.Generated.Stored = true
+						p.advance()
+					} else if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "virtual") {
+						p.advance()
+					}
+					continue
+				}
+				if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "identity") {
+					col.Identity = true
+					p.advance()
+					continue
+				}
+			}
 			// unknown attribute keyword used as ident (e.g. COLLATE, CHARACTER SET)
 			if p.is(lexer.COLLATE) {
 				p.advance()
@@ -1639,14 +2057,12 @@ func (p *Parser) parseDataType() (*ast.DataType, error) {
 		p.advance()
 		if p.is(lexer.INT) {
 			t := p.advance()
-			n, _ := strconv.Atoi(string(t.Raw))
-			dt.Precision = n
+			dt.Precision = atoiBytes(t.Raw)
 		}
 		if p.tryEat(lexer.COMMA) {
 			if p.is(lexer.INT) {
 				t := p.advance()
-				n, _ := strconv.Atoi(string(t.Raw))
-				dt.Scale = n
+				dt.Scale = atoiBytes(t.Raw)
 			}
 		}
 		// ENUM/SET values
@@ -1788,7 +2204,7 @@ func (p *Parser) parseIndexColDefs() ([]*ast.IndexColDef, error) {
 			if err != nil {
 				return nil, err
 			}
-			n, _ := strconv.Atoi(string(t.Raw))
+			n := atoiBytes(t.Raw)
 			icd.Length = arenaNode(&p.arena, n)
 			if _, err := p.eat(lexer.RPAREN); err != nil {
 				return nil, err
@@ -1875,7 +2291,7 @@ func (p *Parser) parseRefAction() ast.RefAction {
 		return ast.NoAction
 	default:
 		// try as ident "NO ACTION"
-		if bytes.EqualFold(p.tok.Raw, []byte("no")) {
+		if equalASCIIFold(p.tok.Raw, "no") {
 			p.advance()
 			p.advance()
 			return ast.NoAction
@@ -1917,10 +2333,10 @@ func (p *Parser) parseCreateIndex() (*ast.CreateIndexStmt, error) {
 
 // ---- CREATE VIEW ----
 
-func (p *Parser) parseCreateView(orReplace bool) (*ast.CreateViewStmt, error) {
+func (p *Parser) parseCreateView(orReplace, materialized bool) (*ast.CreateViewStmt, error) {
 	pos := p.tok.Pos
 	p.advance() // VIEW
-	stmt := arenaNode(&p.arena, ast.CreateViewStmt{TokPos: pos, OrReplace: orReplace})
+	stmt := arenaNode(&p.arena, ast.CreateViewStmt{TokPos: pos, OrReplace: orReplace, Materialized: materialized})
 	name, err := p.parseQualifiedIdent()
 	if err != nil {
 		return nil, err
@@ -1957,7 +2373,7 @@ func (p *Parser) parseAlter() (ast.Statement, error) {
 		return p.parseAlterDatabase(pos)
 	}
 	if !p.tryEatKeyword(lexer.TABLE) {
-		return p.parseGenericDDL([]byte("alter"), p.tok.Raw)
+		return p.parseGenericDDL(kwAlter, p.tok.Raw)
 	}
 	name, err := p.parseQualifiedIdent()
 	if err != nil {
@@ -2030,12 +2446,21 @@ func (p *Parser) parseAlterCmd() (ast.AlterCmd, error) {
 
 	case lexer.DROP:
 		p.advance()
-		if p.tryEatKeyword(lexer.COLUMN) || p.is(lexer.IDENT) || p.is(lexer.BACKTICK) {
+		if p.tryEatKeyword(lexer.CONSTRAINT) {
+			cmd := arenaNode(&p.arena, ast.DropConstraintCmd{TokPos: pos})
+			if p.is(lexer.IF) {
+				p.advance()
+				if !p.tryEatKeyword(lexer.EXISTS) {
+					return nil, p.errorf("expected EXISTS in IF EXISTS")
+				}
+				cmd.IfExists = true
+			}
 			name, err := p.parseIdent()
 			if err != nil {
 				return nil, err
 			}
-			return arenaNode(&p.arena, ast.DropColumnCmd{Name: name, TokPos: pos}), nil
+			cmd.Name = name
+			return cmd, nil
 		}
 		if p.tryEatKeyword(lexer.INDEX) || p.tryEatKeyword(lexer.KEY) {
 			name, err := p.parseIdent()
@@ -2044,9 +2469,82 @@ func (p *Parser) parseAlterCmd() (ast.AlterCmd, error) {
 			}
 			return arenaNode(&p.arena, ast.DropIndexCmd{Name: name, TokPos: pos}), nil
 		}
+		if p.tryEatKeyword(lexer.COLUMN) || p.is(lexer.IDENT) || p.is(lexer.BACKTICK) {
+			name, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return arenaNode(&p.arena, ast.DropColumnCmd{Name: name, TokPos: pos}), nil
+		}
+
+	case lexer.ALTER:
+		p.advance()
+		p.tryEatKeyword(lexer.COLUMN)
+		name, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		cmd := arenaNode(&p.arena, ast.AlterColumnCmd{Name: name, TokPos: pos})
+		if p.tryEatKeyword(lexer.SET) {
+			cmd.Action = actionSet
+			if p.tryEatKeyword(lexer.DEFAULT) {
+				expr, err := p.parseExpr(0)
+				if err != nil {
+					return nil, err
+				}
+				cmd.Expr = expr
+			} else if p.tryEatKeyword(lexer.NOT) {
+				if _, err := p.eat(lexer.NULL_KW); err != nil {
+					return nil, err
+				}
+				cmd.Action = actionSetNotNull
+			}
+		} else if p.tryEatKeyword(lexer.DROP) {
+			cmd.Action = kwDrop
+			if p.tryEatKeyword(lexer.DEFAULT) {
+				cmd.Action = actionDropDefault
+			} else if p.tryEatKeyword(lexer.NOT) {
+				if _, err := p.eat(lexer.NULL_KW); err != nil {
+					return nil, err
+				}
+				cmd.Action = actionDropNotNull
+			}
+		} else if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "type") {
+			cmd.Action = actionType
+			p.advance()
+			// Keep type rewrite permissive; callers can inspect Body through rendering.
+			for !p.is(lexer.COMMA) && !p.is(lexer.SEMICOLON) && !p.is(lexer.EOF) {
+				p.advance()
+			}
+		}
+		return cmd, nil
+
+	case lexer.RENAME:
+		p.advance()
+		if p.tryEatKeyword(lexer.COLUMN) {
+			name, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.eatKeyword(lexer.TO); err != nil {
+				return nil, err
+			}
+			// Represent column rename in a compact alter-column command.
+			newName, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return arenaNode(&p.arena, ast.AlterColumnCmd{Name: name, Action: newName.Raw, TokPos: pos}), nil
+		}
+		p.tryEatKeyword(lexer.TO)
+		newName, err := p.parseQualifiedIdent()
+		if err != nil {
+			return nil, err
+		}
+		return arenaNode(&p.arena, ast.RenameTableCmd{NewName: newName, TokPos: pos}), nil
 
 	case lexer.IDENT:
-		if equalASCIIFold(p.tok.Raw, "modify") {
+		if equalASCIIFold(p.tok.Raw, "modify") || equalASCIIFold(p.tok.Raw, "change") {
 			p.advance()
 			p.tryEatKeyword(lexer.COLUMN)
 			col, err := p.parseColumnDef()
@@ -2065,15 +2563,6 @@ func (p *Parser) parseAlterCmd() (ast.AlterCmd, error) {
 			}
 			return cmd, nil
 		}
-
-	case lexer.RENAME:
-		p.advance()
-		p.tryEatKeyword(lexer.TO)
-		newName, err := p.parseQualifiedIdent()
-		if err != nil {
-			return nil, err
-		}
-		return arenaNode(&p.arena, ast.RenameTableCmd{NewName: newName, TokPos: pos}), nil
 	}
 	return nil, p.errorf("unexpected ALTER TABLE command: %q", p.tok.Raw)
 }
@@ -2081,7 +2570,9 @@ func (p *Parser) parseAlterCmd() (ast.AlterCmd, error) {
 // ---- DROP ----
 
 func (p *Parser) parseDrop() (ast.Statement, error) {
+	pos := p.tok.Pos
 	p.advance() // DROP
+	materialized := p.tryEatKeyword(lexer.MATERIALIZED)
 	switch p.tok.Type {
 	case lexer.DATABASE:
 		return p.parseDropDatabase()
@@ -2090,8 +2581,11 @@ func (p *Parser) parseDrop() (ast.Statement, error) {
 	case lexer.INDEX:
 		return p.parseDropIndex()
 	case lexer.FUNCTION, lexer.PROCEDURE, lexer.TRIGGER:
-		return p.parseGenericDDL([]byte("drop"), p.tok.Raw)
+		return p.parseObjectDDL(kwDrop, p.tok.Raw, pos, false, true)
 	case lexer.VIEW:
+		if materialized {
+			return p.parseObjectDDL(kwDrop, kwMaterializedView, pos, false, true)
+		}
 		p.advance()
 		stmt := arenaNode(&p.arena, ast.DropTableStmt{TokPos: p.tok.Pos})
 		n, err := p.parseQualifiedIdent()
@@ -2104,9 +2598,12 @@ func (p *Parser) parseDrop() (ast.Statement, error) {
 		if equalASCIIFold(p.tok.Raw, "schema") {
 			return p.parseDropDatabase()
 		}
-		return p.parseGenericDDL([]byte("drop"), p.tok.Raw)
+		if equalASCIIFold(p.tok.Raw, "sequence") {
+			return p.parseObjectDDL(kwDrop, p.tok.Raw, pos, false, true)
+		}
+		return p.parseGenericDDL(kwDrop, p.tok.Raw)
 	default:
-		return p.parseGenericDDL([]byte("drop"), p.tok.Raw)
+		return p.parseGenericDDL(kwDrop, p.tok.Raw)
 	}
 }
 
@@ -2120,8 +2617,51 @@ func (p *Parser) parseGenericDDL(verb, obj []byte) (*ast.GenericDDLStmt, error) 
 			stmt.Name = name
 		}
 	}
+	bodyStart := p.tok.Pos
 	for p.tok.Type != lexer.SEMICOLON && p.tok.Type != lexer.EOF {
 		p.advance()
+	}
+	bodyEnd := int(p.tok.Pos)
+	src := p.lex.Source()
+	if int(bodyStart) < bodyEnd && bodyEnd <= len(src) {
+		stmt.Body = src[bodyStart:bodyEnd]
+	}
+	return stmt, nil
+}
+
+func (p *Parser) parseObjectDDL(verb, obj []byte, pos int32, orReplace, allowIfExists bool) (*ast.ObjectDDLStmt, error) {
+	stmt := arenaNode(&p.arena, ast.ObjectDDLStmt{Verb: verb, Object: obj, OrReplace: orReplace, TokPos: pos})
+	p.advance() // object token
+	if allowIfExists && p.is(lexer.IF) {
+		p.advance()
+		if !p.tryEatKeyword(lexer.EXISTS) {
+			return nil, p.errorf("expected EXISTS in IF EXISTS")
+		}
+		stmt.IfExists = true
+	} else if !allowIfExists && p.is(lexer.IF) {
+		p.advance()
+		if !p.tryEatKeyword(lexer.NOT) {
+			return nil, p.errorf("expected NOT in IF NOT EXISTS")
+		}
+		if !p.tryEatKeyword(lexer.EXISTS) {
+			return nil, p.errorf("expected EXISTS in IF NOT EXISTS")
+		}
+		stmt.IfNotExists = true
+	}
+	if p.is(lexer.IDENT) || p.is(lexer.BACKTICK) || p.is(lexer.DQUOTE) {
+		name, err := p.parseIdent()
+		if err == nil {
+			stmt.Name = name
+		}
+	}
+	bodyStart := p.tok.Pos
+	for p.tok.Type != lexer.SEMICOLON && p.tok.Type != lexer.EOF {
+		p.advance()
+	}
+	bodyEnd := int(p.tok.Pos)
+	src := p.lex.Source()
+	if int(bodyStart) < bodyEnd && bodyEnd <= len(src) {
+		stmt.Body = src[bodyStart:bodyEnd]
 	}
 	return stmt, nil
 }
@@ -2200,7 +2740,7 @@ func (p *Parser) parseBegin() (*ast.TransactionStmt, error) {
 	if p.is(lexer.TRANSACTION) || (p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "transaction")) {
 		p.advance()
 	}
-	return arenaNode(&p.arena, ast.TransactionStmt{Action: []byte("begin"), TokPos: pos}), nil
+	return arenaNode(&p.arena, ast.TransactionStmt{Action: actionBegin, TokPos: pos}), nil
 }
 
 func (p *Parser) parseCommit() (*ast.TransactionStmt, error) {
@@ -2209,13 +2749,13 @@ func (p *Parser) parseCommit() (*ast.TransactionStmt, error) {
 	if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "work") {
 		p.advance()
 	}
-	return arenaNode(&p.arena, ast.TransactionStmt{Action: []byte("commit"), TokPos: pos}), nil
+	return arenaNode(&p.arena, ast.TransactionStmt{Action: actionCommit, TokPos: pos}), nil
 }
 
 func (p *Parser) parseRollback() (*ast.TransactionStmt, error) {
 	pos := p.tok.Pos
 	p.advance() // ROLLBACK
-	stmt := arenaNode(&p.arena, ast.TransactionStmt{Action: []byte("rollback"), TokPos: pos})
+	stmt := arenaNode(&p.arena, ast.TransactionStmt{Action: actionRollback, TokPos: pos})
 	if p.is(lexer.IDENT) && equalASCIIFold(p.tok.Raw, "work") {
 		p.advance()
 	}
@@ -2239,7 +2779,7 @@ func (p *Parser) parseStartTransaction() (*ast.TransactionStmt, error) {
 		return nil, p.errorf("expected TRANSACTION after START")
 	}
 	p.advance()
-	stmt := arenaNode(&p.arena, ast.TransactionStmt{Action: []byte("start_transaction"), TokPos: pos})
+	stmt := arenaNode(&p.arena, ast.TransactionStmt{Action: actionStartTx, TokPos: pos})
 	for !p.is(lexer.SEMICOLON) && !p.is(lexer.EOF) {
 		stmt.Options = arenaAppend(&p.arena, stmt.Options, p.advance().Raw)
 	}
@@ -2254,7 +2794,7 @@ func (p *Parser) parseSavepoint() (*ast.TransactionStmt, error) {
 		return nil, err
 	}
 	return arenaNode(&p.arena, ast.TransactionStmt{
-		Action:    []byte("savepoint"),
+		Action:    actionSavepoint,
 		Savepoint: sp,
 		TokPos:    pos,
 	}), nil
@@ -2271,7 +2811,7 @@ func (p *Parser) parseReleaseSavepoint() (*ast.TransactionStmt, error) {
 		return nil, err
 	}
 	return arenaNode(&p.arena, ast.TransactionStmt{
-		Action:    []byte("release_savepoint"),
+		Action:    actionReleaseSP,
 		Savepoint: sp,
 		TokPos:    pos,
 	}), nil
@@ -2284,7 +2824,7 @@ func (p *Parser) parseSetStmt() (ast.Statement, error) {
 		return nil, p.errorf("unsupported SET statement %q", p.tok.Raw)
 	}
 	p.advance() // TRANSACTION
-	stmt := arenaNode(&p.arena, ast.TransactionStmt{Action: []byte("set_transaction"), TokPos: pos})
+	stmt := arenaNode(&p.arena, ast.TransactionStmt{Action: actionSetTx, TokPos: pos})
 	for !p.is(lexer.SEMICOLON) && !p.is(lexer.EOF) {
 		stmt.Options = arenaAppend(&p.arena, stmt.Options, p.advance().Raw)
 	}
@@ -2394,7 +2934,6 @@ func (p *Parser) parseIdent() (*ast.Ident, error) {
 	}
 }
 
-
 func (p *Parser) parseQualifiedIdent() (*ast.QualifiedIdent, error) {
 	id, err := p.parseIdent()
 	if err != nil {
@@ -2412,15 +2951,14 @@ func (p *Parser) parseQualifiedIdent() (*ast.QualifiedIdent, error) {
 	qi := arenaNode(&p.arena, ast.QualifiedIdent{Parts: parts})
 	for p.is(lexer.DOT) {
 		p.advance()
+		if p.is(lexer.STAR) {
+			star := arenaNode(&p.arena, ast.Ident{Raw: p.tok.Raw, Unquoted: "*", TokPos: p.tok.Pos})
+			p.advance()
+			qi.Parts = arenaAppend(&p.arena, qi.Parts, star)
+			return qi, nil
+		}
 		next, err := p.parseIdent()
 		if err != nil {
-			// could be schema.* – treat as ident
-			if p.is(lexer.STAR) {
-				star := arenaNode(&p.arena, ast.Ident{Raw: p.tok.Raw, Unquoted: "*", TokPos: p.tok.Pos})
-				p.advance()
-				qi.Parts = arenaAppend(&p.arena, qi.Parts, star)
-				return qi, nil
-			}
 			return nil, err
 		}
 		qi.Parts = arenaAppend(&p.arena, qi.Parts, next)
@@ -2446,10 +2984,11 @@ func (p *Parser) parseIdentList() ([]*ast.Ident, error) {
 func (p *Parser) parseAssignments() ([]ast.Assignment, error) {
 	var asgn []ast.Assignment
 	for {
-		col, err := p.parseIdent()
+		target, err := p.parseQualifiedIdent()
 		if err != nil {
 			return nil, err
 		}
+		col := target.Parts[len(target.Parts)-1]
 		if _, err := p.eat(lexer.EQ); err != nil {
 			return nil, err
 		}
@@ -2524,4 +3063,15 @@ func bytesToString(raw []byte) string {
 		return ""
 	}
 	return unsafe.String(&raw[0], len(raw))
+}
+
+func atoiBytes(raw []byte) int {
+	n := 0
+	for _, c := range raw {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }

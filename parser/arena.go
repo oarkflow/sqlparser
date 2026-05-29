@@ -44,9 +44,15 @@ func (a *arena) alloc(n int) []byte {
 // The first slab is retained to avoid re-allocation on the next parse.
 func (a *arena) reset() {
 	if len(a.slabs) > 0 {
-		first := a.slabs[0]
+		best := a.slabs[0]
+		for _, slab := range a.slabs[1:] {
+			if len(slab) > len(best) {
+				best = slab
+			}
+		}
+		a.slabs[0] = best
 		a.slabs = a.slabs[:1]
-		a.cur = first
+		a.cur = best
 		a.off = 0
 	}
 }

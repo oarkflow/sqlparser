@@ -39,6 +39,7 @@ type (
 	CallStmt           = ast.CallStmt
 	TransactionStmt    = ast.TransactionStmt
 	GenericDDLStmt     = ast.GenericDDLStmt
+	ObjectDDLStmt      = ast.ObjectDDLStmt
 	ParseError         = parser.ParseError
 	Token              = lexer.Token
 	TokenType          = lexer.TokenType

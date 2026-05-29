@@ -28,6 +28,13 @@ The runner will:
 - Routine/trigger fallback DDL
 - Drop/cleanup statements
 
+### Advanced parser coverage
+
+The newer focused examples cover recently expanded parser support:
+- `examples/sql/11_advanced_select_window_lateral.sql` — recursive CTEs, `DISTINCT ON`, qualified `table.*`, `FILTER`, `OVER`, named `WINDOW`, `LATERAL`, `VALUES` table sources, alias column lists, `NULLS FIRST/LAST`, and `FOR UPDATE`.
+- `examples/sql/12_dml_returning_and_defaults.sql` — `DEFAULT VALUES`, `INSERT ... SET`, `ON CONFLICT ... WHERE`, DML `RETURNING`, qualified update assignments, and MySQL-style multi-table `DELETE`.
+- `examples/sql/13_object_ddl_generated_alter.sql` — generated and identity columns, materialized views, function/sequence object DDL, and richer `ALTER TABLE` commands.
+
 ## Add your own examples
 
 1. Add a new `*.sql` file under `examples/sql/`

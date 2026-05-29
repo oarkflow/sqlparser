@@ -116,6 +116,8 @@ type FuncCall struct {
 	Args     []Expr
 	Distinct bool
 	Star     bool // COUNT(*)
+	Filter   Expr
+	Over     *WindowSpec
 	TokPos   int32
 }
 
@@ -253,8 +255,10 @@ type TableRef interface {
 
 // SimpleTable is a named table with optional alias.
 type SimpleTable struct {
-	Name  *QualifiedIdent
-	Alias *Ident
+	Name    *QualifiedIdent
+	Alias   *Ident
+	Columns []*Ident
+	Lateral bool
 }
 
 func (n *SimpleTable) node()         {}
@@ -263,14 +267,29 @@ func (n *SimpleTable) Pos() int32    { return n.Name.Pos() }
 
 // SubqueryTable is (SELECT ...) [AS alias].
 type SubqueryTable struct {
-	Subq   *SelectStmt
-	Alias  *Ident
-	TokPos int32
+	Subq    *SelectStmt
+	Alias   *Ident
+	Columns []*Ident
+	Lateral bool
+	TokPos  int32
 }
 
 func (n *SubqueryTable) node()         {}
 func (n *SubqueryTable) tableRefNode() {}
 func (n *SubqueryTable) Pos() int32    { return n.TokPos }
+
+// ValuesTable is a VALUES row source in FROM.
+type ValuesTable struct {
+	Rows    [][]Expr
+	Alias   *Ident
+	Columns []*Ident
+	Lateral bool
+	TokPos  int32
+}
+
+func (n *ValuesTable) node()         {}
+func (n *ValuesTable) tableRefNode() {}
+func (n *ValuesTable) Pos() int32    { return n.TokPos }
 
 // JoinTable represents a JOIN expression.
 type JoinTable struct {
@@ -299,17 +318,20 @@ func (n *JoinTable) Pos() int32    { return n.TokPos }
 
 // SelectStmt represents a SELECT statement.
 type SelectStmt struct {
-	With     *WithClause
-	Distinct bool
-	Columns  []SelectColumn
-	From     []TableRef
-	Where    Expr
-	GroupBy  []Expr
-	Having   Expr
-	OrderBy  []OrderByItem
-	Limit    *LimitClause
-	SetOp    *SetOperation // UNION/INTERSECT/EXCEPT
-	TokPos   int32
+	With       *WithClause
+	Distinct   bool
+	DistinctOn []Expr
+	Columns    []SelectColumn
+	From       []TableRef
+	Where      Expr
+	GroupBy    []Expr
+	Having     Expr
+	Windows    []WindowDef
+	OrderBy    []OrderByItem
+	Limit      *LimitClause
+	Lock       *LockClause
+	SetOp      *SetOperation // UNION/INTERSECT/EXCEPT
+	TokPos     int32
 }
 
 func (n *SelectStmt) node()      {}
@@ -330,9 +352,10 @@ type CTE struct {
 
 // SelectColumn is a single column in a SELECT list.
 type SelectColumn struct {
-	Expr  Expr
-	Alias *Ident
-	Star  bool // table.*
+	Expr      Expr
+	Alias     *Ident
+	Star      bool // * or table.*
+	Qualifier *QualifiedIdent
 }
 
 // OrderByItem is a single ORDER BY key.
@@ -340,6 +363,30 @@ type OrderByItem struct {
 	Expr       Expr
 	Desc       bool
 	NullsFirst *bool
+}
+
+// WindowDef is a named WINDOW clause entry.
+type WindowDef struct {
+	Name *Ident
+	Spec *WindowSpec
+}
+
+// WindowSpec is the supported shape of OVER (...).
+type WindowSpec struct {
+	Name        *Ident
+	PartitionBy []Expr
+	OrderBy     []OrderByItem
+	Raw         []byte
+	TokPos      int32
+}
+
+// LockClause is SELECT ... FOR UPDATE/SHARE.
+type LockClause struct {
+	Strength []byte
+	Tables   []*Ident
+	NoWait   bool
+	SkipLock bool
+	TokPos   int32
 }
 
 // LimitClause is LIMIT count [OFFSET skip].
@@ -368,11 +415,15 @@ type InsertStmt struct {
 	Table               *QualifiedIdent
 	Columns             []*Ident
 	Values              [][]Expr // rows
+	Set                 []Assignment
 	Select              *SelectStmt
+	DefaultValues       bool
 	OnDupKey            []Assignment
 	OnConflictTarget    []*Ident
+	OnConflictWhere     Expr
 	OnConflictDoNothing bool
 	OnConflictUpdate    []Assignment
+	Returning           []SelectColumn
 	Ignore              bool
 	Replace             bool // REPLACE INTO
 	TokPos              int32
@@ -390,13 +441,14 @@ type Assignment struct {
 
 // UpdateStmt represents an UPDATE statement.
 type UpdateStmt struct {
-	With   *WithClause
-	Tables []TableRef
-	Set    []Assignment
-	Where  Expr
-	Order  []OrderByItem
-	Limit  *LimitClause
-	TokPos int32
+	With      *WithClause
+	Tables    []TableRef
+	Set       []Assignment
+	Where     Expr
+	Order     []OrderByItem
+	Limit     *LimitClause
+	Returning []SelectColumn
+	TokPos    int32
 }
 
 func (n *UpdateStmt) node()      {}
@@ -405,13 +457,15 @@ func (n *UpdateStmt) Pos() int32 { return n.TokPos }
 
 // DeleteStmt represents a DELETE statement.
 type DeleteStmt struct {
-	With   *WithClause
-	Tables []*QualifiedIdent
-	From   []TableRef
-	Where  Expr
-	Order  []OrderByItem
-	Limit  *LimitClause
-	TokPos int32
+	With      *WithClause
+	Tables    []*QualifiedIdent
+	From      []TableRef
+	Using     []TableRef
+	Where     Expr
+	Order     []OrderByItem
+	Limit     *LimitClause
+	Returning []SelectColumn
+	TokPos    int32
 }
 
 func (n *DeleteStmt) node()      {}
@@ -424,6 +478,8 @@ func (n *DeleteStmt) Pos() int32 { return n.TokPos }
 type CreateTableStmt struct {
 	Table       *QualifiedIdent
 	Temporary   bool
+	Unlogged    bool
+	OrReplace   bool
 	IfNotExists bool
 	Columns     []*ColumnDef
 	Constraints []*TableConstraint
@@ -450,6 +506,7 @@ type ColumnDef struct {
 	References    *ForeignKeyRef
 	Check         Expr
 	Generated     *GeneratedCol
+	Identity      bool
 	OnUpdate      Expr
 	TokPos        int32
 }
@@ -580,6 +637,27 @@ func (c *DropIndexCmd) node()         {}
 func (c *DropIndexCmd) alterCmdNode() {}
 func (c *DropIndexCmd) Pos() int32    { return c.TokPos }
 
+type DropConstraintCmd struct {
+	Name     *Ident
+	IfExists bool
+	TokPos   int32
+}
+
+func (c *DropConstraintCmd) node()         {}
+func (c *DropConstraintCmd) alterCmdNode() {}
+func (c *DropConstraintCmd) Pos() int32    { return c.TokPos }
+
+type AlterColumnCmd struct {
+	Name   *Ident
+	Action []byte
+	Expr   Expr
+	TokPos int32
+}
+
+func (c *AlterColumnCmd) node()         {}
+func (c *AlterColumnCmd) alterCmdNode() {}
+func (c *AlterColumnCmd) Pos() int32    { return c.TokPos }
+
 type RenameTableCmd struct {
 	NewName *QualifiedIdent
 	TokPos  int32
@@ -629,11 +707,12 @@ func (n *DropIndexStmt) Pos() int32 { return n.TokPos }
 
 // CreateViewStmt represents CREATE VIEW.
 type CreateViewStmt struct {
-	Name      *QualifiedIdent
-	Columns   []*Ident
-	Select    *SelectStmt
-	OrReplace bool
-	TokPos    int32
+	Name         *QualifiedIdent
+	Columns      []*Ident
+	Select       *SelectStmt
+	OrReplace    bool
+	Materialized bool
+	TokPos       int32
 }
 
 func (n *CreateViewStmt) node()      {}
@@ -744,9 +823,27 @@ type GenericDDLStmt struct {
 	Verb   []byte
 	Object []byte
 	Name   *Ident
+	Body   []byte
 	TokPos int32
 }
 
 func (n *GenericDDLStmt) node()      {}
 func (n *GenericDDLStmt) stmtNode()  {}
 func (n *GenericDDLStmt) Pos() int32 { return n.TokPos }
+
+// ObjectDDLStmt represents common CREATE/DROP object statements whose bodies
+// are intentionally preserved rather than fully decomposed.
+type ObjectDDLStmt struct {
+	Verb        []byte
+	Object      []byte
+	Name        *Ident
+	OrReplace   bool
+	IfExists    bool
+	IfNotExists bool
+	Body        []byte
+	TokPos      int32
+}
+
+func (n *ObjectDDLStmt) node()      {}
+func (n *ObjectDDLStmt) stmtNode()  {}
+func (n *ObjectDDLStmt) Pos() int32 { return n.TokPos }
