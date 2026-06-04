@@ -91,6 +91,19 @@ func TestConvertFunctionRewrite(t *testing.T) {
 	}
 }
 
+func TestConvertDialectNamedArguments(t *testing.T) {
+	out, err := sqlparser.ConvertDialect(`SELECT make_interval(days => :days, hours := ?)`, sqlparser.DialectPostgres)
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+	if !strings.Contains(out, `"days" => $1`) {
+		t.Fatalf("expected named => argument with converted placeholder, got: %s", out)
+	}
+	if !strings.Contains(out, `"hours" := $2`) {
+		t.Fatalf("expected named := argument with converted placeholder, got: %s", out)
+	}
+}
+
 func TestConvertOnDupKeyToOnConflict(t *testing.T) {
 	in := `INSERT INTO users (id, name) VALUES (1, 'a') ON DUPLICATE KEY UPDATE name = 'b'`
 	out, err := sqlparser.ConvertDialect(in, sqlparser.DialectPostgres)

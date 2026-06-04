@@ -8,6 +8,7 @@ import (
 
 	sqlparser "github.com/oarkflow/sqlparser"
 	"github.com/oarkflow/sqlparser/ast"
+	"github.com/oarkflow/sqlparser/lexer"
 )
 
 // ---- helpers ----
@@ -173,6 +174,38 @@ func TestSelectOffset(t *testing.T) {
 
 func TestSelectFunctionCalls(t *testing.T) {
 	mustParse(t, `SELECT NOW(), COALESCE(a, b, 0), IFNULL(x, 'default') FROM t`)
+}
+
+func TestSelectFunctionNamedArguments(t *testing.T) {
+	stmt := mustParse(t, `SELECT make_interval(days => :days, hours := ?) FROM t`)
+	sel := stmt.(*ast.SelectStmt)
+	call, ok := sel.Columns[0].Expr.(*ast.FuncCall)
+	if !ok {
+		t.Fatalf("expected *FuncCall, got %T", sel.Columns[0].Expr)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected 2 args, got %d", len(call.Args))
+	}
+	first, ok := call.Args[0].(*ast.NamedArg)
+	if !ok {
+		t.Fatalf("expected first arg *NamedArg, got %T", call.Args[0])
+	}
+	if got := first.Name.Parts[0].Unquoted; got != "days" {
+		t.Fatalf("expected first arg name days, got %q", got)
+	}
+	if first.Op != lexer.DARROW {
+		t.Fatalf("expected => operator, got %s", first.Op)
+	}
+	if _, ok := first.Value.(*ast.Param); !ok {
+		t.Fatalf("expected first arg value *Param, got %T", first.Value)
+	}
+	second, ok := call.Args[1].(*ast.NamedArg)
+	if !ok {
+		t.Fatalf("expected second arg *NamedArg, got %T", call.Args[1])
+	}
+	if second.Op != lexer.ASSIGN {
+		t.Fatalf("expected := operator, got %s", second.Op)
+	}
 }
 
 func TestSelectJSONBOperators(t *testing.T) {
@@ -403,6 +436,23 @@ func TestCallStatement(t *testing.T) {
 	stmt := mustParse(t, "CALL refresh_cache(42, 'full')")
 	if _, ok := stmt.(*ast.CallStmt); !ok {
 		t.Fatalf("expected *CallStmt, got %T", stmt)
+	}
+}
+
+func TestCallNamedArguments(t *testing.T) {
+	stmt := mustParse(t, "CALL refresh_cache(mode => 'full', force := ?)")
+	call, ok := stmt.(*ast.CallStmt)
+	if !ok {
+		t.Fatalf("expected *CallStmt, got %T", stmt)
+	}
+	if len(call.Args) != 2 {
+		t.Fatalf("expected 2 args, got %d", len(call.Args))
+	}
+	if _, ok := call.Args[0].(*ast.NamedArg); !ok {
+		t.Fatalf("expected first arg *NamedArg, got %T", call.Args[0])
+	}
+	if _, ok := call.Args[1].(*ast.NamedArg); !ok {
+		t.Fatalf("expected second arg *NamedArg, got %T", call.Args[1])
 	}
 }
 

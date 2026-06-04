@@ -1200,6 +1200,8 @@ func (r *dialectRenderer) renderExpr(expr Expr) string {
 		return "NULL"
 	case *ast.Param:
 		return r.renderParam(e.Raw)
+	case *ast.NamedArg:
+		return r.renderQualifiedIdent(e.Name) + " " + r.opString(e.Op) + " " + r.renderExpr(e.Value)
 	case *ast.BinaryExpr:
 		return "(" + r.renderExpr(e.Left) + " " + r.opString(e.Op) + " " + r.renderExpr(e.Right) + ")"
 	case *ast.UnaryExpr:
@@ -1368,6 +1370,8 @@ func (r *dialectRenderer) opString(op lexer.TokenType) string {
 		return "NOT"
 	case lexer.EQ:
 		return "="
+	case lexer.ASSIGN:
+		return ":="
 	case lexer.NEQ:
 		return "!="
 	case lexer.LT:
@@ -1392,6 +1396,8 @@ func (r *dialectRenderer) opString(op lexer.TokenType) string {
 		return "&"
 	case lexer.ARROW:
 		return "->"
+	case lexer.DARROW:
+		return "=>"
 	case lexer.DARROW2:
 		return "->>"
 	case lexer.HASHARROW:

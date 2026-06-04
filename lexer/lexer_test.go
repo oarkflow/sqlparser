@@ -88,6 +88,7 @@ func TestLexerOperators(t *testing.T) {
 		{"->", ARROW},
 		{"->>", DARROW2},
 		{"=>", DARROW},
+		{":=", ASSIGN},
 		{"#>", HASHARROW},
 		{"#>>", HASHDARROW},
 		{"@>", ATGT},

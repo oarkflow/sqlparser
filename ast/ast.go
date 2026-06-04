@@ -88,6 +88,18 @@ func (n *Param) node()      {}
 func (n *Param) exprNode()  {}
 func (n *Param) Pos() int32 { return n.TokPos }
 
+// NamedArg is a named function/procedure argument: name => expr or name := expr.
+type NamedArg struct {
+	Name   *QualifiedIdent
+	Value  Expr
+	Op     lexer.TokenType
+	TokPos int32
+}
+
+func (n *NamedArg) node()      {}
+func (n *NamedArg) exprNode()  {}
+func (n *NamedArg) Pos() int32 { return n.TokPos }
+
 // BinaryExpr is a binary operation: expr op expr.
 type BinaryExpr struct {
 	Left, Right Expr

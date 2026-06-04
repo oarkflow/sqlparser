@@ -34,6 +34,7 @@ const (
 	COMMA     // ,
 	SEMICOLON // ;
 	COLON     // :
+	ASSIGN    // :=
 	DOT       // .
 	DOTDOT    // ..
 	STAR      // *
@@ -255,6 +256,7 @@ var tokenNames = [...]string{
 	COMMA:      ",",
 	SEMICOLON:  ";",
 	COLON:      ":",
+	ASSIGN:     ":=",
 	DOT:        ".",
 	DOTDOT:     "..",
 	STAR:       "*",

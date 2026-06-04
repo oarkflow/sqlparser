@@ -572,7 +572,10 @@ func (l *Lexer) lexPunct(start int) Token {
 		}
 	case ':':
 		// named parameter :name
-		if p := peek(); isAlphaB(p) || p == '_' {
+		if p := peek(); p == '=' {
+			advance()
+			typ = ASSIGN
+		} else if isAlphaB(p) || p == '_' {
 			for l.pos < len(src) && identContTable[src[l.pos]] {
 				advance()
 			}

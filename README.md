@@ -103,7 +103,7 @@ Use `ParseOptions` for untrusted SQL: set `MaxBytes`, `MaxTokens`, `MaxDepth`, `
 - `EXISTS (subquery)`
 - `CASE ... WHEN ... THEN ... [ELSE ...] END`
 - `CAST(expr AS type)`
-- Function calls: `f()`, `f(DISTINCT expr)`, `f(*)`
+- Function calls: `f()`, `f(DISTINCT expr)`, `f(*)`, named args `name => expr` / `name := expr`
 - Named params: `:name`, `@name`, `$N`, `?`
 
 ---

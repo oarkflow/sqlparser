@@ -1371,7 +1371,7 @@ func (p *Parser) parseFuncCall(name *ast.QualifiedIdent) (*ast.FuncCall, error) 
 func (p *Parser) parseExprList() ([]ast.Expr, error) {
 	var exprs []ast.Expr
 	for {
-		e, err := p.parseExpr(0)
+		e, err := p.parseArgExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -1381,6 +1381,43 @@ func (p *Parser) parseExprList() ([]ast.Expr, error) {
 		}
 	}
 	return exprs, nil
+}
+
+func (p *Parser) parseArgExpr() (ast.Expr, error) {
+	left, err := p.parseExpr(0)
+	if err != nil {
+		return nil, err
+	}
+	switch p.tok.Type {
+	case lexer.DARROW, lexer.ASSIGN:
+	default:
+		return left, nil
+	}
+	name, ok := p.namedArgName(left)
+	if !ok {
+		return nil, p.errorf("named argument must start with an identifier")
+	}
+	op := p.tok.Type
+	pos := p.tok.Pos
+	p.advance()
+	value, err := p.parseExpr(0)
+	if err != nil {
+		return nil, err
+	}
+	return arenaNode(&p.arena, ast.NamedArg{Name: name, Value: value, Op: op, TokPos: pos}), nil
+}
+
+func (p *Parser) namedArgName(expr ast.Expr) (*ast.QualifiedIdent, bool) {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		var parts []*ast.Ident
+		parts = arenaAppend(&p.arena, parts, e)
+		return arenaNode(&p.arena, ast.QualifiedIdent{Parts: parts}), true
+	case *ast.QualifiedIdent:
+		return e, true
+	default:
+		return nil, false
+	}
 }
 
 func (p *Parser) parseOrderBy() ([]ast.OrderByItem, error) {

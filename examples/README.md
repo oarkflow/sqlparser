@@ -34,6 +34,7 @@ The newer focused examples cover recently expanded parser support:
 - `examples/sql/11_advanced_select_window_lateral.sql` — recursive CTEs, `DISTINCT ON`, qualified `table.*`, `FILTER`, `OVER`, named `WINDOW`, `LATERAL`, `VALUES` table sources, alias column lists, `NULLS FIRST/LAST`, and `FOR UPDATE`.
 - `examples/sql/12_dml_returning_and_defaults.sql` — `DEFAULT VALUES`, `INSERT ... SET`, `ON CONFLICT ... WHERE`, DML `RETURNING`, qualified update assignments, and MySQL-style multi-table `DELETE`.
 - `examples/sql/13_object_ddl_generated_alter.sql` — generated and identity columns, materialized views, function/sequence object DDL, and richer `ALTER TABLE` commands.
+- `examples/sql/15_named_params_and_args.sql` — named bind parameters plus named function/procedure arguments with `=>` and `:=`.
 
 ## Add your own examples
 
