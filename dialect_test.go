@@ -104,6 +104,37 @@ func TestConvertDialectNamedArguments(t *testing.T) {
 	}
 }
 
+func TestConvertDialectInsertValuesPayloadParam(t *testing.T) {
+	out, err := sqlparser.ConvertDialect(`INSERT INTO orders (account_id, status) VALUES :rows RETURNING id`, sqlparser.DialectPostgres)
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+	if !strings.Contains(out, `VALUES $1`) {
+		t.Fatalf("expected values payload placeholder conversion, got: %s", out)
+	}
+	if !strings.Contains(out, `RETURNING "id"`) {
+		t.Fatalf("expected RETURNING clause, got: %s", out)
+	}
+}
+
+func TestConvertDialectDDLNamedParams(t *testing.T) {
+	in := `
+		CREATE TABLE param_defaults (
+			account_id BIGINT DEFAULT :default_account_id CHECK (account_id <> :blocked_account_id),
+			status VARCHAR(32) DEFAULT @default_status
+		);
+		ALTER TABLE param_defaults ALTER COLUMN status SET DEFAULT :next_status`
+	out, err := sqlparser.ConvertDialect(in, sqlparser.DialectPostgres)
+	if err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+	for _, want := range []string{"DEFAULT $1", `CHECK (("account_id" != $2))`, "DEFAULT $3", "DEFAULT $4"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in converted DDL, got: %s", want, out)
+		}
+	}
+}
+
 func TestConvertOnDupKeyToOnConflict(t *testing.T) {
 	in := `INSERT INTO users (id, name) VALUES (1, 'a') ON DUPLICATE KEY UPDATE name = 'b'`
 	out, err := sqlparser.ConvertDialect(in, sqlparser.DialectPostgres)

@@ -1637,20 +1637,28 @@ func (p *Parser) parseInsert() (*ast.InsertStmt, error) {
 		}
 		stmt.Set = asgn
 	} else if p.tryEatKeyword(lexer.VALUES) {
-		for {
-			if _, err := p.eat(lexer.LPAREN); err != nil {
-				return nil, err
-			}
-			row, err := p.parseExprList()
+		if !p.is(lexer.LPAREN) {
+			expr, err := p.parseExpr(0)
 			if err != nil {
 				return nil, err
 			}
-			stmt.Values = arenaAppend(&p.arena, stmt.Values, row)
-			if _, err := p.eat(lexer.RPAREN); err != nil {
-				return nil, err
-			}
-			if !p.tryEat(lexer.COMMA) {
-				break
+			stmt.ValuesExpr = expr
+		} else {
+			for {
+				if _, err := p.eat(lexer.LPAREN); err != nil {
+					return nil, err
+				}
+				row, err := p.parseExprList()
+				if err != nil {
+					return nil, err
+				}
+				stmt.Values = arenaAppend(&p.arena, stmt.Values, row)
+				if _, err := p.eat(lexer.RPAREN); err != nil {
+					return nil, err
+				}
+				if !p.tryEat(lexer.COMMA) {
+					break
+				}
 			}
 		}
 	}

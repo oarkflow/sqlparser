@@ -313,7 +313,10 @@ func (r *dialectRenderer) renderInsert(s *ast.InsertStmt) (string, error) {
 		}
 		b.WriteString(")")
 	}
-	if len(s.Values) > 0 {
+	if s.ValuesExpr != nil {
+		b.WriteString(" VALUES ")
+		b.WriteString(r.renderExpr(s.ValuesExpr))
+	} else if len(s.Values) > 0 {
 		b.WriteString(" VALUES ")
 		for i, row := range s.Values {
 			if i > 0 {
@@ -861,6 +864,37 @@ func (r *dialectRenderer) renderColumnDef(c *ast.ColumnDef) string {
 		b.WriteString(" COMMENT ")
 		b.WriteString(r.renderExpr(c.Comment))
 	}
+	if c.References != nil {
+		b.WriteString(" REFERENCES ")
+		b.WriteString(r.renderQualifiedIdent(c.References.Table))
+		if len(c.References.Columns) > 0 {
+			b.WriteString(" (")
+			for i, col := range c.References.Columns {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(r.renderIdent(col))
+			}
+			b.WriteByte(')')
+		}
+		if c.References.OnDelete != ast.NoAction {
+			b.WriteString(" ON DELETE ")
+			b.WriteString(r.renderRefAction(c.References.OnDelete))
+		}
+		if c.References.OnUpdate != ast.NoAction {
+			b.WriteString(" ON UPDATE ")
+			b.WriteString(r.renderRefAction(c.References.OnUpdate))
+		}
+	}
+	if c.Check != nil {
+		b.WriteString(" CHECK (")
+		b.WriteString(r.renderExpr(c.Check))
+		b.WriteByte(')')
+	}
+	if c.OnUpdate != nil {
+		b.WriteString(" ON UPDATE ")
+		b.WriteString(r.renderExpr(c.OnUpdate))
+	}
 	return b.String()
 }
 
@@ -942,7 +976,35 @@ func (r *dialectRenderer) renderConstraint(c *ast.TableConstraint) string {
 			b.WriteByte(')')
 		}
 	}
+	if c.OnDelete != ast.NoAction {
+		b.WriteString(" ON DELETE ")
+		b.WriteString(r.renderRefAction(c.OnDelete))
+	}
+	if c.OnUpdate != ast.NoAction {
+		b.WriteString(" ON UPDATE ")
+		b.WriteString(r.renderRefAction(c.OnUpdate))
+	}
+	if c.Check != nil {
+		b.WriteString(" (")
+		b.WriteString(r.renderExpr(c.Check))
+		b.WriteByte(')')
+	}
 	return b.String()
+}
+
+func (r *dialectRenderer) renderRefAction(action ast.RefAction) string {
+	switch action {
+	case ast.Restrict:
+		return "RESTRICT"
+	case ast.Cascade:
+		return "CASCADE"
+	case ast.SetNull:
+		return "SET NULL"
+	case ast.SetDefault:
+		return "SET DEFAULT"
+	default:
+		return "NO ACTION"
+	}
 }
 
 func (r *dialectRenderer) renderAlterCmd(cmd ast.AlterCmd) string {

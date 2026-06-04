@@ -427,6 +427,7 @@ type InsertStmt struct {
 	Table               *QualifiedIdent
 	Columns             []*Ident
 	Values              [][]Expr // rows
+	ValuesExpr          Expr     // whole VALUES payload, e.g. :rows or :row
 	Set                 []Assignment
 	Select              *SelectStmt
 	DefaultValues       bool
